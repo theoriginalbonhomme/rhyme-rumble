@@ -161,6 +161,8 @@ button.tile{cursor:pointer}
 .vhead{display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap}
 
 .lost{background:var(--pink); color:var(--ink); border:3px solid var(--ink); border-radius:14px; padding:10px 14px; font-weight:700; text-align:center}
+.botline{font-family:var(--display); font-size:clamp(1.15rem,5.2vw,1.6rem); line-height:1.25; color:var(--sun); text-wrap:balance; min-height:2.5em}
+.lyrics{width:100%; text-align:left; background:#150A30; border:3px solid #000; border-radius:14px; padding:12px 14px; font-weight:500; line-height:1.5}
 #toast{position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 18px); margin:0 auto; max-width:520px; z-index:20;
   background:var(--ink); color:var(--paper); border:3px solid var(--paper); border-radius:14px; padding:12px 16px; font-weight:500; text-align:center; overflow-wrap:anywhere}
 .busy{min-height:55vh; display:grid; place-content:center; gap:16px; text-align:center}
@@ -273,7 +275,7 @@ function avatarSVG(cfg){
   if(extra === 'Earring') s += `<circle cx="57" cy="107" r="6" fill="#F2B705" ${st} stroke-width="3"/>`;
   return s + '</svg>';
 }
-const avHTML = cfg => `<span class="av">${avatarSVG(cfg)}</span>`;
+const avHTML = cfg => `<span class="av">${cfg && cfg.robot ? robotSVG(cfg.robot) : avatarSVG(cfg)}</span>`;
 
 const MIC_ICON = `<svg viewBox="0 0 40 48" aria-hidden="true"><rect x="12" y="2" width="16" height="26" rx="8" fill="currentColor"/><path d="M6 20c0 9 6 14 14 14s14-5 14-14M20 34v9M11 45h18" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>`;
 const BOT_SVG = `<svg viewBox="0 0 120 96" role="img" aria-label="Boombot, the robot judge"><path d="M34 22 V10 H86 V22" fill="none" stroke="#1C1233" stroke-width="6" stroke-linejoin="round"/><rect x="6" y="22" width="108" height="68" rx="14" fill="#19C6C9" stroke="#1C1233" stroke-width="5"/><circle cx="34" cy="58" r="19" fill="#1C1233"/><circle cx="34" cy="58" r="8" fill="#FFCE1F"/><circle cx="86" cy="58" r="19" fill="#1C1233"/><circle cx="86" cy="58" r="8" fill="#FFCE1F"/><rect x="48" y="30" width="24" height="9" rx="3" fill="#FBF8FF" stroke="#1C1233" stroke-width="3"/><path d="M52 78 Q60 84 68 78" fill="none" stroke="#1C1233" stroke-width="4" stroke-linecap="round"/></svg>`;
@@ -673,7 +675,7 @@ function netTick(){
   if(o){ if(!(isTurn(me.pid) && S.turn.step === 'rec')) net.outVerse = null; else if(now - o.at > 5000){ o.at = now; netSend('h', { t:'verse', id:o.id, judge:o.judge, bars:o.bars }); } }
 }
 function leave(silent){
-  stopAudio(); abortRec();
+  stopAudio(); abortRec(); stopBot();
   if(S && net.key){ if(isHost) netSend('a', { t:'closed' }); else netSend('h', { t:'bye' }); }
   netClose();
   isHost = false; S = null; lost = false; clips.clear(); autoPlayed.clear(); heard.clear();
@@ -732,7 +734,7 @@ function hostHandle(pid, m){
     }
   }
 }
-function crowdOf(v){ const battlers = [S.set.a, S.set.b]; const fans = S.order.filter(p => S.players[p] && S.players[p].on && !battlers.includes(p)); return fans.length ? fans : battlers.filter(p => p !== v.by); }
+function crowdOf(v){ if(S.solo) return []; const battlers = [S.set.a, S.set.b]; const fans = S.order.filter(p => S.players[p] && S.players[p].on && !battlers.includes(p)); return fans.length ? fans : battlers.filter(p => p !== v.by); }
 function canRate(pid, v){ return pid !== v.by && crowdOf(v).includes(pid); }
 function verseScore(v){
   if(v.skipped) return { judge:0, crowd:0, total:0, avg:0, n:0 };
@@ -753,14 +755,226 @@ const host = {
   start(){ const s = S.set; if(!s.a || !s.b) return toast('Pick two rappers for the battle first.');
     S.phase = 'battle'; S.verses = []; S.turn = { i:0, step:'ready' }; autoPlayed.clear(); heard.clear(); push(); },
   next(){ if(S.phase !== 'battle') return; S.turn.i++; if(S.turn.i >= S.set.rounds * 2){ S.phase = 'results'; S.turn = null; } else S.turn.step = 'ready'; push(); },
-  skip(){ if(S.phase !== 'battle' || S.turn.step === 'listen') return;
-    S.verses.push({ id:'skip' + rid(5), by:performer(), round:Math.floor(S.turn.i / 2) + 1, skipped:true, beat:S.set.beat, bars:0, dur:0, judge:{ flow:0, energy:0, stamina:0 }, ratings:{} });
-    host.next(); },
   end(){ if(S.phase === 'lobby') return; S.phase = 'lobby'; S.turn = null; S.verses = [];
     for(const p of [...S.order]) if(!S.players[p].on){ delete S.players[p]; S.order = S.order.filter(x => x !== p); }
     fixBattlers(); push(); },
   rematch(){ [S.set.a, S.set.b] = [S.set.b, S.set.a]; host.start(); }
 };
+
+/* ---------- solo mode: battle a robot rapper -------------------------
+   The robot performs rhymes written in advance, spoken by the device's
+   built-in voice. It is not a live AI: the level sets which rhymes it
+   picks and the range Boombot scores it in.                           */
+const ROBOTS = {
+  easy:   { name:'Robo Rookie', label:'Easy',   blurb:'Still learning. Slow rhymes, low scores.',  range:[3, 5], pitch:1.35, tint:'#27B863' },
+  normal: { name:'MC Circuit',  label:'Normal', blurb:'A fair fight. Solid rhymes, solid scores.',  range:[5, 7], pitch:1,    tint:'#19C6C9' },
+  expert: { name:'DJ Megabyte', label:'Expert', blurb:'Fast, tricky rhymes. Hard to beat.',         range:[7, 9], pitch:.75,  tint:'#7A4DFF' }
+};
+const BOT_LINES = {
+  en: {
+    easy: [
+      ['Beep beep boop, I am new at this,', 'I try to rhyme but sometimes I miss.'],
+      ['My battery is low, my rhymes are slow,', 'but I keep on going, go go go.'],
+      ['I am a robot, I like to dance,', 'give me a beat and give me a chance.'],
+      ['One plus one, I know it is two,', 'I am just happy to rap with you.'],
+      ['My wheels go round, my lights go blink,', 'wait a second, I need to think.'],
+      ['I ate a cable, it tasted bad,', 'now my circuits are a little bit sad.'],
+      ['Hello human, how do you do?', 'I wrote this little rhyme for you.'],
+      ['I can count to a hundred and ten,', 'then I forget and I start again.'],
+      ['My favourite food is a triple A,', 'I charge at night and I rap all day.'],
+      ['Oops, I dropped my rhyme on the floor,', 'hold on a moment, I will find some more.']
+    ],
+    normal: [
+      ['I am made of metal but my flow is smooth,', 'every single circuit in me wants to groove.'],
+      ['You bring the heat, I bring the fan,', 'cooling down the room like only robots can.'],
+      ['My memory is big, I never forget,', 'this is the best battle you have had yet.'],
+      ['I do my homework at the speed of light,', 'then I write rhymes for the rest of the night.'],
+      ['Pizza or tacos, I cannot eat,', 'so I just feast on a tasty beat.'],
+      ['I am plugged in, charged up, ready to go,', 'step to the mic and enjoy the show.'],
+      ['My antenna is up, I can hear the crowd,', 'turn my speakers up and I get loud.'],
+      ['You have a heart and I have a chip,', 'both of us know how to let it rip.'],
+      ['I downloaded rhythm, installed some style,', 'rapping with you makes this robot smile.'],
+      ['No sleep, no snacks, no time to rest,', 'I just practise till I am the best.']
+    ],
+    expert: [
+      ['Calculating syllables, my processor is blazing,', 'every bar I generate is statistically amazing.'],
+      ['I am the algorithm of rhythm, the code that never crashes,', 'dropping lines so bright your screen is seeing flashes.'],
+      ['Gigabytes of rhymes and terabytes of flow,', 'faster than your wifi, I am a one-bot show.'],
+      ['My circuits stay cool while the speakers overheat,', 'I assemble every sentence to the centre of the beat.'],
+      ['Upgrade your vocabulary, here comes the patch,', 'I am lightning in a laptop and you will not find a match.'],
+      ['From the motherboard to the microphone, wired for the win,', 'a symphony of syntax in a shiny suit of tin.'],
+      ['I rhyme in binary, zero one, zero one,', 'translate it into human and it still sounds fun.'],
+      ['Respect to my opponent, you have rhythm, you have heart,', 'but I studied every rapper since the very start.'],
+      ['Precision is my mission, repetition is my friend,', 'I can keep this tempo steady till the very end.'],
+      ['No bugs in my bars and no lag in my rap,', 'when I finish this verse even robots clap.']
+    ]
+  },
+  et: {
+    easy: [
+      ['Piiks-piiks, olen robot, tere, tere,', 'mul on kodus suur ja tore pere.'],
+      ['Aku hakkab tühjaks saama, vaja laadida,', 'siis saan jälle sinuga koos räppi proovida.'],
+      ['Üks pluss üks on kaks ja kaks pluss kaks on neli,', 'matemaatikas ma olen päris kõva veli.'],
+      ['Tuled mul vilguvad, rattad mul veerevad,', 'kõik mu väiksed mutrid rõõmust keerlevad.'],
+      ['Sõin kogemata ühe juhtme ära,', 'nüüd teeb kõht mul imelikku kära.'],
+      ['Tere, sõber, kuidas läheb sul?', 'Sinu jaoks on väike riim siin mul.'],
+      ['Loen ma sajani ja natuke veel,', 'siis ma ära eksin poolel teel.'],
+      ['Minu lemmiktoit on patarei,', 'laen end öösel, päeval ütlen hei.'],
+      ['Oih, mu riim kukkus maha põrandale,', 'oota hetk, ma toon uue kohale.'],
+      ['Ma olen robot, mulle meeldib tants,', 'anna mulle biit ja anna šanss.']
+    ],
+    normal: [
+      ['Olen küll metallist, aga rütm on mul veres,', 'kõik mu väiksed kiibid tantsivad mu keres.'],
+      ['Sina tood kuuma, mina olen jahe,', 'minu ja mikrofoni vahel pole vahe.'],
+      ['Koolitöö teen valmis kiirelt nagu tuul,', 'siis on riimid jälle minu suul.'],
+      ['Pitsat ma ei söö ja kommi ka ei taha,', 'mulle maitseb biit, see ei jää kunagi maha.'],
+      ['Aku on täis ja tuju on laes,', 'mikrofon on kindlalt minu käes.'],
+      ['Antenn on mul püsti, kuulen kõiki teid,', 'hea muusika ühendab alati meid.'],
+      ['Sinul on süda, minul on mootor,', 'riimide alal olen mina doktor.'],
+      ['Ei maga ma, ei söö ja puhkust ma ei tee,', 'harjutan nii kaua, kuni selge on mu tee.'],
+      ['Kruvid on mul kinni ja õli on vahetatud,', 'selle lahingu jaoks olen hästi valmistatud.'],
+      ['Kes teeb siin kõva häält? See olen mina,', 'nüüd võta mikrofon ja näita, mis teed sina.']
+    ],
+    expert: [
+      ['Arvutan silpe, protsessor on kuum,', 'minu riimidest on täis kogu ruum.'],
+      ['Olen rütmi algoritm, mis kunagi ei eksi,', 'silmapilguga ma loon su jaoks uut teksti.'],
+      ['Gigabaitides on riime, terabaitides on hoogu,', 'olen kiirem kui su wifi, vaata seda voogu.'],
+      ['Kõlarid on kuumad, aga pea on mul külm,', 'iga rida, mis ma ütlen, on kui omaette film.'],
+      ['Uuenda oma sõnavara, siit tuleb uus pakett,', 'olen välk sülearvutis, ma olen räpirakett.'],
+      ['Emaplaadist mikrofonini olen võiduks loodud,', 'minu salmid on kui kingid, hoolikalt on toodud.'],
+      ['Riimin kahendkoodis: üks, null, üks, null,', 'sellist stiili pole enne olnud sul.'],
+      ['Austus sulle, vastane, sul rütm on veres sees,', 'aga mina olen robot, kellel riim on alati ees.'],
+      ['Täpsus on mu missioon, see on minu amet,', 'sõnad voolavad mul pehmelt nagu samet.'],
+      ['Pole viga minu koodis, pole viivitust mu loos,', 'kui ma lõpetan, siis plaksutavad robotid kõik koos.']
+    ]
+  }
+};
+function robotSVG(level){
+  const R = ROBOTS[level] || ROBOTS.normal, I = '#1C1233', st = `stroke="${I}" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"`;
+  const eyes = level === 'expert' ? `<rect x="58" y="78" width="84" height="22" rx="8" fill="${I}"/><rect x="66" y="85" width="30" height="8" rx="4" fill="#FF4F8B"/><rect x="104" y="85" width="30" height="8" rx="4" fill="#FF4F8B"/>`
+    : level === 'easy' ? `<circle cx="80" cy="90" r="13" fill="#fff" ${st}/><circle cx="120" cy="90" r="13" fill="#fff" ${st}/><circle cx="83" cy="93" r="5" fill="${I}"/><circle cx="117" cy="93" r="5" fill="${I}"/>`
+    : `<circle cx="80" cy="90" r="12" fill="${I}"/><circle cx="120" cy="90" r="12" fill="${I}"/><circle cx="80" cy="90" r="5" fill="#FFCE1F"/><circle cx="120" cy="90" r="5" fill="#FFCE1F"/>`;
+  return `<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Robot rapper"><rect width="200" height="200" fill="#FFCE1F"/>
+    <path d="M100 100 L-40 -40 L40 -60Z M100 100 L240 -40 L160 -60Z M100 100 L-60 120 L-60 60Z M100 100 L260 120 L260 60Z" fill="#fff" opacity=".2"/>
+    <path d="M30 206 C30 168 60 152 100 152 C140 152 170 168 170 206Z" fill="${R.tint}" ${st}/><rect x="84" y="132" width="32" height="26" fill="#C9C2DA" ${st}/>
+    <path d="M100 44 V24" fill="none" ${st}/><circle cx="100" cy="20" r="9" fill="#FF4F8B" ${st}/>
+    <rect x="32" y="78" width="16" height="34" rx="6" fill="#C9C2DA" ${st}/><rect x="152" y="78" width="16" height="34" rx="6" fill="#C9C2DA" ${st}/>
+    <rect x="46" y="44" width="108" height="94" rx="20" fill="${R.tint}" ${st}/>${eyes}
+    <rect x="70" y="112" width="60" height="14" rx="5" fill="#fff" ${st} stroke-width="4"/><path d="M85 112 V126 M100 112 V126 M115 112 V126" stroke="${I}" stroke-width="3"/>
+    <circle cx="100" cy="182" r="8" fill="#FFCE1F" ${st} stroke-width="4"/></svg>`;
+}
+let solo = Object.assign({ level:'normal', lang:'en', beat:'boom', bars:4, rounds:2 }, store.get('rr.solo', {}));
+if(!ROBOTS[solo.level]) solo.level = 'normal'; if(!BOT_LINES[solo.lang]) solo.lang = 'en'; if(!BEATS[solo.beat]) solo.beat = 'boom';
+let bot = null, soloUsed = [];
+const hasSpeech = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+function botVoice(lang){
+  if(!hasSpeech) return null;
+  try{ const vs = speechSynthesis.getVoices(), want = lang === 'et' ? ['et'] : ['en-us', 'en-gb', 'en'];
+    for(const w of want){ const v = vs.find(x => String(x.lang).toLowerCase().replace('_', '-').startsWith(w)); if(v) return v; } }catch{}
+  return null;
+}
+if(hasSpeech) try{ speechSynthesis.addEventListener('voiceschanged', () => { if(view === 'solo') render(); }); }catch{}
+function ttsUnlock(){ if(!hasSpeech) return; try{ speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); }catch{} }
+const syllables = s => (String(s).toLowerCase().match(/[aeiouyäöüõ]+/g) || []).length;
+function pickLines(bars){
+  const pool = BOT_LINES[S.solo.lang][S.solo.level], out = [];
+  for(let k = 0; k < bars / 2; k++){
+    if(soloUsed.length >= pool.length) soloUsed = [];
+    let i; do i = rnd(pool.length); while(soloUsed.includes(i));
+    soloUsed.push(i); out.push(...pool[i]);
+  }
+  return out;
+}
+function startSolo(){
+  audio(); ttsUnlock(); stopAudio(); netClose(); store.set('rr.solo', solo);
+  const R = ROBOTS[solo.level]; isHost = true; roomCode = ''; soloUsed = [];
+  S = newState('SOLO'); S.solo = { level:solo.level, lang:solo.lang };
+  S.players[me.pid] = { name:me.name, av:me.av, on:true }; S.players.robot = { name:R.name, av:{ robot:solo.level }, on:true }; S.order = [me.pid, 'robot'];
+  Object.assign(S.set, { beat:solo.beat, bars:solo.bars, rounds:solo.rounds, a:me.pid, b:'robot', topic:'You vs. ' + R.name });
+  view = 'room'; keepAwake(); host.start(); scrollTo(0, 0);
+}
+function robotGo(){
+  if(bot || !S || !S.solo || performer() !== 'robot' || S.phase !== 'battle' || S.turn.step !== 'ready') return;
+  ttsUnlock(); stopAudio();
+  const ac = audio(), set = S.set, so = S.solo, R = ROBOTS[so.level], lines = pickLines(set.bars);
+  const out = ac.createGain(); out.gain.value = .5; out.connect(MASTER);
+  const sch = scheduleBeat(ac, out, set.beat, ac.currentTime + .45, set.bars, true);
+  const voice = botVoice(so.lang), voiced = hasSpeech && (!!voice || so.lang === 'en');
+  const b = bot = { out, sch, lines, talking:false, voiced, timers:[], waits:0 };
+  lines.forEach((line, k) => b.timers.push(setTimeout(() => {
+    if(bot !== b || !voiced) return;
+    try{
+      const u = new SpeechSynthesisUtterance(line.replace(/[,.:;!?]/g, ' ')); if(voice) u.voice = voice; u.lang = voice ? voice.lang : 'en-US';
+      u.rate = clamp(syllables(line) / (sch.bar * 3.8), 1, 1.8);          // fast enough that each line fits its bar u.pitch = R.pitch; u.volume = 1;
+      u.onstart = () => { if(bot === b) b.talking = true; }; u.onend = u.onerror = () => { if(bot === b) b.talking = false; };
+      speechSynthesis.speak(u);
+    }catch{}
+  }, Math.max(0, (sch.verseStart + k * sch.bar - ac.currentTime) * 1000 - 60))));
+  b.timers.push(setTimeout(robotDone, (sch.end - ac.currentTime) * 1000 + 500));
+  S.turn.step = 'rec'; push();
+}
+function robotDone(){
+  const b = bot; if(!b || !S) return;
+  if(b.voiced && b.waits < 8){ let busy = false; try{ busy = speechSynthesis.speaking || speechSynthesis.pending; }catch{} if(busy){ b.waits++; b.timers.push(setTimeout(robotDone, 400)); return; } }
+  const r = ROBOTS[S.solo.level].range, pt = () => r[0] + rnd(r[1] - r[0] + 1), id = 'bot' + rid(6);
+  stopBot();
+  S.verses.push({ id, by:'robot', robot:true, lines:b.lines, round:Math.floor(S.turn.i / 2) + 1, beat:S.set.beat, bars:S.set.bars, dur:0,
+    judge:{ flow:pt(), energy:pt(), stamina:pt() }, ratings:{} });
+  heard.add(id); S.turn.step = 'listen'; push();
+}
+function stopBot(){
+  const b = bot; if(!b) return; bot = null;
+  b.timers.forEach(clearTimeout); try{ b.out.disconnect(); }catch{} if(hasSpeech) try{ speechSynthesis.cancel(); }catch{}
+}
+function soloView(){
+  const chips = (k, list) => list.map(([val, label]) => `<button class="chip" aria-pressed="${solo[k] === val}" data-act="soloset" data-k="${k}" data-v="${val}">${label}</button>`).join('');
+  const R = ROBOTS[solo.level], noVoice = solo.lang === 'et' && !botVoice('et');
+  return `<section class="card">
+    <div class="me"><span class="av" style="width:92px;flex:none">${robotSVG(solo.level)}</span><div class="grow"><span class="lab">Your opponent</span><div class="name">${R.name}</div><span class="small">${R.blurb}</span></div></div>
+    <div class="group"><span class="lab">Level</span><div class="opts">${chips('level', Object.entries(ROBOTS).map(([id, r]) => [id, r.label]))}</div></div>
+    <div class="group"><span class="lab">The robot raps in</span><div class="opts">${chips('lang', [['en', 'English'], ['et', 'Eesti keel']])}</div>
+      ${!hasSpeech ? '<span class="small">This browser cannot speak, so the robot\'s rhymes will only show on screen.</span>' : noVoice ? '<span class="small">This device has no Estonian voice, so the robot\'s rhymes will show on screen without speech.</span>' : ''}</div>
+    <div class="group"><span class="lab">Beat</span><div class="opts">${chips('beat', Object.entries(BEATS).map(([id, b]) => [id, `${b.name} · ${b.bpm} BPM`]))}</div></div>
+    <div class="group"><span class="lab">Verse length</span><div class="opts">${chips('bars', [[4, '4 bars'], [8, '8 bars']])}</div></div>
+    <div class="group"><span class="lab">Rounds</span><div class="opts">${chips('rounds', [[1, '1'], [2, '2'], [3, '3']])}</div></div>
+  </section>
+  <button class="btn pink big" data-act="solostart">Start the battle</button>
+  <div class="center"><button class="btn mini" data-act="home">Back</button></div>`;
+}
+
+/* ---------- save the finished battle as one sound file ---------------- */
+let dlBusy = false;
+function wavBlob(d, rate){
+  const b = new ArrayBuffer(44 + d.length * 2), v = new DataView(b), w = (o, s) => { for(let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + d.length * 2, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, d.length * 2, true);
+  for(let i = 0; i < d.length; i++){ const s = clamp(d[i], -1, 1); v.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true); }
+  return new Blob([b], { type:'audio/wav' });
+}
+async function renderBattle(){
+  const SR = 32000, vs = S.verses.filter(v => !v.skipped && clips.has(v.id)); if(!vs.length) return null;
+  let total = .3; const plan = vs.map(v => { const c = clips.get(v.id), bar = 240 / (BEATS[v.beat] || BEATS.boom).bpm, at = total; total += Math.max(v.bars * bar, c.f.length / RATE) + .8; return { v, c, at }; });
+  const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext, oc = new OC(1, Math.ceil(total * SR), SR);
+  const comp = oc.createDynamicsCompressor(); comp.threshold.value = -10; comp.ratio.value = 6;
+  const master = oc.createGain(); master.gain.value = .9; master.connect(comp); comp.connect(oc.destination);
+  for(const { v, c, at } of plan){
+    const beatOut = oc.createGain(); beatOut.gain.value = .5; beatOut.connect(master); scheduleBeat(oc, beatOut, v.beat, at, v.bars, false);
+    const buf = oc.createBuffer(1, c.f.length, RATE); buf.getChannelData(0).set(c.f);
+    const src = oc.createBufferSource(), g = oc.createGain(); g.gain.value = 1.3; src.buffer = buf; src.connect(g); g.connect(master); src.start(at);
+  }
+  const d = (await oc.startRendering()).getChannelData(0); let pk = 0; for(let i = 0; i < d.length; i++){ const a = Math.abs(d[i]); if(a > pk) pk = a; }
+  if(pk > .95){ const g = .95 / pk; for(let i = 0; i < d.length; i++) d[i] *= g; }
+  return wavBlob(d, SR);
+}
+async function downloadBattle(){
+  if(dlBusy || !S) return; dlBusy = true; render();
+  try{
+    const blob = await renderBattle();
+    if(!blob) toast('There are no recorded verses on this device to save.');
+    else { const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = 'rhyme-rumble-battle.wav'; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000); toast('Battle saved as rhyme-rumble-battle.wav'); }
+  }catch(e){ console.warn(e); toast('Could not make the sound file on this device.'); }
+  dlBusy = false; render();
+}
 
 /* ---------- recording a verse -------------------------------------- */
 async function startVerse(){
@@ -840,6 +1054,7 @@ function afterState(){
     if(playing && (!v || v.id !== playing.id) && S.phase !== 'results') stopAudio();
     if(rec && !(isTurn(me.pid) && S.turn.step !== 'listen')) abortRec();
     if(S.phase !== 'lobby' && micTest){ micTest.close(); micTest = null; }
+    if(bot && !(S.phase === 'battle' && performer() === 'robot' && S.turn.step === 'rec')) stopBot();
     maybeAutoPlay();
   }
   render();
@@ -850,7 +1065,19 @@ function tick(){
   requestAnimationFrame(tick);
   if(view !== 'room' || !S) return;
   const ac = AC; let lvl = 0;
-  if(rec && !rec.done && ac){
+  if(bot && ac){
+    const t = ac.currentTime, b = bot, pre = t < b.sch.verseStart, cnt = $('#botcount'), box = $('#botbars');
+    if(cnt) cnt.hidden = !pre; if(box) box.hidden = pre;
+    if(pre){ if(cnt) cnt.textContent = clamp(Math.ceil((b.sch.verseStart - t) / (b.sch.step * 4)), 1, 4); }
+    else {
+      const pos = (t - b.sch.verseStart) / b.sch.bar, i = clamp(Math.floor(pos), 0, b.lines.length - 1);
+      const ln = $('#botline'), nx = $('#botnext'), pr = $('#botprog');
+      if(ln && ln.textContent !== b.lines[i]) ln.textContent = b.lines[i];
+      if(nx){ const n = b.lines[i + 1] || ''; if(nx.textContent !== n) nx.textContent = n; }
+      if(pr) pr.style.width = clamp(pos / b.lines.length * 100, 0, 100) + '%';
+      lvl = b.voiced ? (b.talking ? .3 + Math.random() * .55 : .05) : .25 + .3 * Math.abs(Math.sin(t * 9));
+    }
+  } else if(rec && !rec.done && ac){
     const t = ac.currentTime, r = rec, box = $('#recbox');
     lvl = clamp(r.mic.level * 6, 0, 1);
     if(box){
@@ -880,6 +1107,7 @@ function render(){
   const app = $('#app'); let h = '';
   if(view === 'home') h = homeView();
   else if(view === 'creator') h = creatorView();
+  else if(view === 'solo') h = soloView();
   else if(view === 'busy') h = `<div class="busy"><div class="spin"></div><h2>${esc(busyText)}</h2><div><button class="btn mini" data-act="leave">Cancel</button></div></div>`;
   else if(view === 'room' && S) h = S.phase === 'lobby' ? lobbyView() : S.phase === 'battle' ? battleView() : resultsView();
   document.body.classList.toggle('stage', view === 'room' && !!S && S.phase !== 'lobby');
@@ -896,6 +1124,8 @@ function homeView(){
   </section>
   <section class="card">
     <button class="btn pink big" data-act="create">Start a battle room</button>
+    <button class="btn teal big" data-act="solo">Battle the robot</button>
+    <p class="small center">No opponent around? Practise against a robot rapper.</p>
     <div class="group"><label class="lab" for="code">Got a room code?</label>
       <form class="row" data-form="join"><input id="code" class="field code grow" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDEF" value="${esc(joinCode)}">
       <button class="btn sun" type="submit">Join</button></form></div>
@@ -970,7 +1200,7 @@ function judgeCard(v){
   const stat = (label, n) => `<div class="stat"><span>${label}</span><span class="bar"><i style="width:${n * 10}%"></i></span><span class="n">${n}</span></div>`;
   return `<div class="judge"><div class="who"><span class="bot">${BOT_SVG}</span><div class="grow"><span class="lab">Boombot says</span><div style="font-weight:700">${esc(judgeSays(j))}</div></div></div>
     ${stat('Flow', j.flow)}${stat('Energy', j.energy)}${stat('Stamina', j.stamina)}
-    <div class="sum"><span class="pill">Boombot ${sc.judge}/30</span><span class="pill">Crowd ${sc.n ? sc.avg.toFixed(1) + ' mics = ' + sc.crowd : '…'}/20</span><span class="pill tot">${sc.total} points</span></div></div>`;
+    <div class="sum"><span class="pill">Boombot ${sc.judge}/30</span>${S.solo ? '' : `<span class="pill">Crowd ${sc.n ? sc.avg.toFixed(1) + ' mics = ' + sc.crowd : '…'}/20</span>`}<span class="pill tot">${sc.total} points</span></div></div>`;
 }
 function micsRow(v){
   const mine = v.ratings[me.pid] || 0;
@@ -985,6 +1215,7 @@ function battleView(){
     panel = mine
       ? `<h2>Your turn, ${esc(P.name)}!</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. You get a 4-beat count-in, then go.</p>
          <button class="btn pink big" data-act="drop">Drop the beat</button><p class="small">Headphones sound best. The mic switches off when your verse ends.</p>`
+      : cur === 'robot' ? `<h2>${esc(P.name)} is up next</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. Listen and read along.</p><button class="btn pink big" data-act="robotgo">Bring it on</button>`
       : `<h2>${esc(P.name)} is warming up…</h2><p class="small">${s.bars} bars of ${BEATS[s.beat].name} coming up.</p>${P.on === false ? '<p>They seem to have lost their connection.</p>' : ''}`;
   } else if(t.step === 'rec'){
     if(mine && rec && !rec.done) panel = `<div id="recbox" style="display:grid;gap:14px;justify-items:center;width:100%">
@@ -997,38 +1228,47 @@ function battleView(){
         <button class="btn mini" data-act="done">I'm done</button></div>`;
     else if(mine && rec) panel = `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><h2>Sending your verse…</h2>`;
     else if(mine) panel = `<h2>Sending your verse…</h2><p class="small">Taking too long?</p><button class="btn mini" data-act="redo">Record it again</button>`;
+    else if(cur === 'robot') panel = `<span class="onair">On the mic</span>
+        <div id="botcount" class="count">4</div>
+        <div id="botbars" style="display:grid;gap:12px;width:100%;justify-items:center" hidden>
+          <div class="botline" id="botline"></div><div class="small" id="botnext"></div><div class="track"><i id="botprog"></i></div></div>
+        ${bot && !bot.voiced ? '<p class="small">No voice for this language on this device. Read along!</p>' : ''}`;
     else panel = `<span class="onair">On the mic</span><h2>${esc(P.name)} is rapping</h2>
         <div class="eq">${[40, 75, 55, 95, 60, 85, 45].map(k => `<i style="--k:${k}"></i>`).join('')}</div><p class="small">You will hear the verse as soon as it is done.</p>`;
   } else {
     const v = curVerse(), has = clips.has(v.id), now = playing && playing.id === v.id, done = heard.has(v.id);
     const crowd = crowdOf(v), got = crowd.filter(p => v.ratings[p]).length;
-    panel = `<h2>${now ? 'Now playing' : 'That was'}: ${esc(P.name)}</h2>
+    if(v.robot) panel = `<h2>That was: ${esc(P.name)}</h2><div class="lyrics">${v.lines.map(esc).join('<br>')}</div>${judgeCard(v)}
+      <button class="btn pink big" data-act="next">${t.i + 1 >= s.rounds * 2 ? 'See the results' : 'Next verse'}</button>`;
+    else panel = `<h2>${now ? 'Now playing' : 'That was'}: ${esc(P.name)}</h2>
       ${has ? `<div class="track"><i id="playprog" style="${now ? '' : 'width:100%'}"></i></div>
                <div class="row" style="justify-content:center"><button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${now ? 'Start over' : 'Play it again'}</button></div>`
             : `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><p class="small">Getting the verse…</p>`}
-      ${canRate(me.pid, v) ? micsRow(v) : `<p class="small">${v.by === me.pid ? 'The crowd is rating your verse.' : 'The crowd is rating this verse.'}</p>`}
+      ${S.solo ? '' : canRate(me.pid, v) ? micsRow(v) : `<p class="small">${v.by === me.pid ? 'The crowd is rating your verse.' : 'The crowd is rating this verse.'}</p>`}
       ${done ? judgeCard(v) : `<p class="small">Boombot is listening…</p>`}
-      <p class="small">${got} of ${crowd.length} crowd rating${crowd.length === 1 ? '' : 's'} in</p>
+      ${S.solo ? '' : `<p class="small">${got} of ${crowd.length} crowd rating${crowd.length === 1 ? '' : 's'} in</p>`}
       ${isHost ? `<button class="btn pink big" data-act="next">${t.i + 1 >= s.rounds * 2 ? 'See the results' : 'Next verse'}</button>` : `<p class="small">Waiting for ${esc(hostName)} to continue…</p>`}`;
   }
   return `<div class="hud"><span>Round ${round} of ${s.rounds}</span><span class="t">${esc(s.topic)}</span></div>
     <div class="face">${fighter(s.a, cur === s.a, tot[s.a] || 0)}<span class="vs">VS</span>${fighter(s.b, cur === s.b, tot[s.b] || 0)}</div>
     <section class="panel">${panel}</section>
-    ${isHost ? `<div class="hostbar">${t.step !== 'listen' ? '<button class="btn mini" data-act="skip">Skip this turn</button>' : ''}<button class="btn mini" data-act="end">End battle</button></div>` : ''}`;
+    ${isHost ? `<div class="hostbar"><button class="btn mini" data-act="end">${S.solo ? 'Quit battle' : 'End battle'}</button></div>` : ''}`;
 }
 function resultsView(){
   const s = S.set, tot = totals(false), a = tot[s.a] || 0, b = tot[s.b] || 0, tie = a === b, w = a >= b ? s.a : s.b;
   const W = S.players[w] || { name:'?', av:{} }, hostName = S.players[S.host] ? S.players[S.host].name : 'the host';
   const rows = S.verses.map(v => { const P = S.players[v.by] || { name:'?' }, sc = verseScore(v);
     return `<div class="vrow"><div class="vhead"><strong>Round ${v.round} · ${esc(P.name)}</strong>
-      ${v.skipped ? '<span class="pill">Skipped</span>' : clips.has(v.id) ? `<button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${playing && playing.id === v.id ? 'Start over' : 'Play'}</button>` : ''}</div>
-      ${v.skipped ? '' : `<div class="sum"><span class="pill">Flow ${v.judge.flow}</span><span class="pill">Energy ${v.judge.energy}</span><span class="pill">Stamina ${v.judge.stamina}</span><span class="pill">Crowd ${sc.crowd}/20</span><span class="pill tot">${sc.total}</span></div>`}</div>`; }).join('');
+      ${v.skipped ? '<span class="pill">Skipped</span>' : v.robot ? '<span class="pill">Robot</span>' : clips.has(v.id) ? `<button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${playing && playing.id === v.id ? 'Start over' : 'Play'}</button>` : ''}</div>
+      ${v.skipped ? '' : `<div class="sum"><span class="pill">Flow ${v.judge.flow}</span><span class="pill">Energy ${v.judge.energy}</span><span class="pill">Stamina ${v.judge.stamina}</span>${S.solo ? '' : `<span class="pill">Crowd ${sc.crowd}/20</span>`}<span class="pill tot">${sc.total}</span></div>`}</div>`; }).join('');
   return `<div class="winner">${tie ? `<div class="crown">It's a tie!</div><p>${a} points each. Settle it with a rematch.</p>`
       : `<span class="lab" style="color:#CFC4F2">Winner</span>${avHTML(W.av)}<div class="crown">${esc(W.name)}</div>`}</div>
     <div class="face">${fighter(s.a, tie || w === s.a, a)}<span class="vs">VS</span>${fighter(s.b, tie || w === s.b, b)}</div>
     <section class="card"><h2>Every verse</h2>${rows || '<p>No verses were recorded.</p>'}
-      <p class="small">Each verse scores up to 30 from Boombot and up to 20 from the crowd.</p></section>
-    ${isHost ? `<div class="row"><button class="btn pink grow" data-act="rematch">Rematch</button><button class="btn grow" data-act="end">Back to the lobby</button></div>`
+      <p class="small">${S.solo ? 'Each verse scores up to 30 from Boombot.' : 'Each verse scores up to 30 from Boombot and up to 20 from the crowd.'}</p></section>
+    ${S.verses.some(v => clips.has(v.id)) ? `<button class="btn sun big" data-act="download" ${dlBusy ? 'disabled' : ''}>${dlBusy ? 'Making the sound file…' : 'Download the battle'}</button>
+      <p class="small center">${S.solo ? 'Saves your verses with the beat as one sound file. The robot\'s voice cannot be recorded.' : 'Saves every verse with the beat as one sound file (WAV).'}</p>` : ''}
+    ${isHost ? `<div class="row"><button class="btn pink grow" data-act="rematch">Rematch</button><button class="btn grow" data-act="end">${S.solo ? 'Back to start' : 'Back to the lobby'}</button></div>`
              : `<p class="center small">Waiting for ${esc(hostName)} to pick what happens next…</p>`}`;
 }
 
@@ -1052,6 +1292,12 @@ document.addEventListener('click', e => {
     case 'savecreator': me.name = cleanName(draft.name); me.av = cleanAv(draft.av); view = creatorBack; saveMe(); render(); break;
     case 'create': createRoom(); break;
     case 'leave': leave(); break;
+    case 'home': view = 'home'; render(); scrollTo(0, 0); break;
+    case 'solo': view = 'solo'; render(); scrollTo(0, 0); break;
+    case 'soloset': { const k = el.dataset.k, v = el.dataset.v; solo[k] = k === 'bars' || k === 'rounds' ? Number(v) : v; if(k === 'beat') previewBeat(v); render(); break; }
+    case 'solostart': startSolo(); break;
+    case 'robotgo': robotGo(); break;
+    case 'download': downloadBattle(); break;
     case 'invite': invite(); break;
     case 'miccheck': micCheck(); break;
     case 'hear': previewBeat(S.set.beat); break;
@@ -1068,8 +1314,7 @@ document.addEventListener('click', e => {
     case 'spin': { let t; do t = TOPICS[rnd(TOPICS.length)]; while(t === S.set.topic); host.set('topic', t); break; }
     case 'start': host.start(); break;
     case 'next': host.next(); break;
-    case 'skip': host.skip(); break;
-    case 'end': host.end(); break;
+    case 'end': if(S.solo) leave(); else host.end(); break;
     case 'rematch': host.rematch(); break;
   }
 });
