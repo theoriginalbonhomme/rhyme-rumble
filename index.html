@@ -1306,7 +1306,7 @@ function render(){
   else if(view === 'mini' && mini) h = miniView();
   else if(view === 'busy') h = `<div class="busy"><div class="spin"></div><h2>${esc(busyText)}</h2><div><button class="btn mini" data-act="home">Cancel</button></div></div>`;
   else if(view === 'room' && S) h = S.phase === 'lobby' ? lobbyView() : S.phase === 'battle' ? battleView() : resultsView();
-  document.body.classList.toggle('stage', view === 'room' && !!S && S.phase !== 'lobby');
+  document.body.classList.toggle('stage', (view === 'room' && !!S && S.phase !== 'lobby') || (view === 'mini' && !!mini && mini.stage === 'rec'));
   if(lost && view === 'room') h = `<div class="lost" role="alert">No connection to the game server. Trying again… Your room is safe.</div>` + h;
   app.innerHTML = h;
 }
