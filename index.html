@@ -1314,7 +1314,7 @@ const logo = () => `<h1 class="logo"><span>Rhyme</span><span>Rumble</span></h1>`
 function homeView(){
   const rooms = recent.filter(c => recentInfo[c]);
   return `${logo()}
-  <p class="tag">Design your rapper. Grab the mic. Battle your friends.</p>
+  <p class="tag">Think you can out-rap me? Step into my Rhyme Rumble room and prove it.</p>
   <section class="card">
     <div class="me">${avHTML(me.av)}<div class="grow"><span class="lab">Your rapper</span><div class="name">${esc(me.name)}</div></div></div>
     <button class="btn teal" data-act="creator">Change my look</button>
