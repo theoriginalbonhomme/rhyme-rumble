@@ -115,6 +115,7 @@ button.tile{cursor:pointer}
 .face{display:grid; grid-template-columns:1fr auto 1fr; gap:10px; align-items:end}
 .fighter{display:grid; gap:12px; text-align:center; min-width:0; transition:transform .25s,opacity .25s; transform:scale(.86); opacity:.62}
 .fighter.on{transform:scale(1); opacity:1}
+.nextup{justify-self:center; font-family:var(--display); font-size:.7rem; letter-spacing:.05em; padding:.2em .6em; border:2px solid #000; border-radius:999px; background:var(--teal); color:var(--ink)}
 .fighter .av{border-color:#000; transition:transform .07s; max-width:190px; margin:0 auto}
 .fighter.on .av{transform:scale(calc(1 + var(--lvl,0)*.09))}
 .fighter.on .av{box-shadow:0 0 0 4px var(--sun),0 0 38px rgba(255,206,31,.55)}
@@ -1540,9 +1541,9 @@ function lobbyView(){
   ${can ? `<button class="btn pink big" data-act="start" ${ready ? '' : 'disabled'}>${ready ? 'Start the battle' : 'Need two rappers'}</button>` : ''}
   <div class="row" style="justify-content:center"><button class="btn mini" data-act="home">Back to home</button>${myRoom && !roomClosed ? '<button class="btn mini" data-act="leave">Leave this room</button>' : ''}</div>`;
 }
-function fighter(pid, on, pts){
+function fighter(pid, on, pts, next){
   const p = S.players[pid] || { name:'Gone', av:{} };
-  return `<div class="fighter${on ? ' on' : ''}">${avHTML(p.av)}<span class="nm">${esc(p.name)}</span><span class="pts">${pts}</span></div>`;
+  return `<div class="fighter${on ? ' on' : ''}">${avHTML(p.av)}<span class="nm">${esc(p.name)}</span><span class="pts">${pts}</span>${next ? '<span class="nextup">Up next</span>' : ''}</div>`;
 }
 function judgeCard(v){
   const sc = verseScore(v), j = v.judge;
@@ -1572,6 +1573,7 @@ function versePanel(v){
 function battleView(){
   const s = S.set, cur = performer(), mine = isTurn(me.pid) && myRoom, P = S.players[cur] || { name:'?' }, tot = totals();
   const round = Math.min(Math.floor(S.verses.length / 2) + 1, s.rounds), last = lastVerse();
+  const pv = playing && S.verses.find(v => v.id === playing.id), spot = pv ? pv.by : cur;
   let panel = '';
   if(roomClosed) panel = `<h2>This room has closed</h2><p>It closed on ${fmtDay(closesAt)} before the battle finished. You can still listen to every verse.</p>`;
   else if(mine && rec && !rec.done) panel = `<div id="recbox" style="display:grid;gap:14px;justify-items:center;width:100%">
@@ -1599,7 +1601,7 @@ function battleView(){
   else panel = `<h2>Waiting for ${esc(P.name)}</h2><p class="small">${esc(P.name)} can answer any time, now or later. The room stays open until ${fmtDay(closesAt)}, and the verse shows up here.</p>
         ${myRoom ? `<button class="btn sun" data-act="remind">Remind ${esc(P.name)}</button>` : `<button class="btn pink" data-act="join">Join the crowd to rate verses</button>`}`;
   return `<div class="hud"><span>Round ${round} of ${s.rounds}</span><span class="t">${esc(s.topic)}</span></div>
-    <div class="face">${fighter(s.a, cur === s.a, tot[s.a] || 0)}<span class="vs">VS</span>${fighter(s.b, cur === s.b, tot[s.b] || 0)}</div>
+    <div class="face">${fighter(s.a, spot === s.a, tot[s.a] || 0, spot !== cur && cur === s.a)}<span class="vs">VS</span>${fighter(s.b, spot === s.b, tot[s.b] || 0, spot !== cur && cur === s.b)}</div>
     ${last ? versePanel(last) : ''}
     <section class="panel">${panel}</section>
     <div class="hostbar">${S.solo ? '<button class="btn mini" data-act="end">Quit battle</button>' : `<button class="btn mini" data-act="home">Back to home</button>${canSteer() && !roomClosed ? '<button class="btn mini" data-act="end">End battle</button>' : ''}`}</div>`;
