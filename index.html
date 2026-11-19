@@ -173,6 +173,28 @@ button.tile{cursor:pointer}
 .roomrow .rs span{color:var(--muted); overflow-wrap:anywhere}
 .panel + .panel{margin-top:0}
 .share .row a{text-decoration:none}
+.minis{display:grid; gap:10px}
+.mg{display:grid; gap:2px; text-align:left; width:100%; padding:12px 14px; background:#fff; border:3px solid var(--ink); border-radius:14px; box-shadow:3px 3px 0 var(--ink); cursor:pointer; color:var(--ink)}
+.mg b{font-family:var(--display); font-weight:400; font-size:1.05rem}
+.mg span{color:var(--muted); font-size:.9rem}
+.mg:active{transform:translate(2px,2px); box-shadow:1px 1px 0 var(--ink)}
+.badgelist{display:flex; flex-wrap:wrap; gap:6px}
+.wordrow{display:flex; flex-wrap:wrap; gap:10px; justify-content:center}
+.bigword{font-family:var(--display); font-size:clamp(1.2rem,6vw,1.7rem); background:var(--sun); color:var(--ink); border:3px solid var(--ink); border-radius:14px; padding:.25em .6em; box-shadow:3px 3px 0 var(--ink); overflow-wrap:anywhere}
+.stagepanel{gap:18px}
+.won{display:grid; gap:6px; justify-items:center; text-align:center; background:var(--sun); border:3px solid var(--ink); border-radius:16px; padding:14px}
+.won .plus{font-family:var(--display); font-size:2rem; line-height:1}
+.won .nb,.won .nbadge{font-weight:700}
+.target{font-family:var(--display); font-size:clamp(2.4rem,14vw,4rem); line-height:1; text-align:center; color:var(--pink); -webkit-text-stroke:2px var(--ink); text-shadow:3px 3px 0 var(--ink)}
+.target.small-t{font-size:2rem}
+.track.light{background:#E4DCF7; border-color:var(--ink)}
+.track.light i{background:var(--pink)}
+.rwlist{display:flex; flex-wrap:wrap; gap:6px; min-height:2em; align-content:flex-start}
+.rw{font-weight:700; padding:.2em .6em; border:2px solid var(--ink); border-radius:999px; background:#fff}
+.rw.ok{background:var(--teal)}
+.rw.no{text-decoration:line-through; color:var(--muted)}
+.vsrow{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+.vsrow > div{display:grid; gap:6px; align-content:start; min-width:0}
 #toast{position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 18px); margin:0 auto; max-width:520px; z-index:20;
   background:var(--ink); color:var(--paper); border:3px solid var(--paper); border-radius:14px; padding:12px 16px; font-weight:500; text-align:center; overflow-wrap:anywhere}
 .busy{min-height:55vh; display:grid; place-content:center; gap:16px; text-align:center}
@@ -911,6 +933,7 @@ async function startVerse(){
 function abortRec(){ if(!rec) return; clearTimeout(rec.timer); try{ rec.out.disconnect(); }catch{} rec.mic.close(); rec = null; }
 function clearRecFlag(){ if(S && !S.solo && S.rec && S.rec.pid === me.pid) mutate(d => { if(!d.rec || d.rec.pid !== me.pid) return false; d.rec = null; }); }
 function finishVerse(){
+  if(rec && rec.mini) return finishMini();
   const r = rec; if(!r || r.done) return; r.done = true; clearTimeout(r.timer);
   const ac = audio(), sr = ac.sampleRate, endT = Math.min(ac.currentTime, r.sch.end + r.lat);
   try{ r.out.disconnect(); }catch{}
@@ -1000,7 +1023,7 @@ function afterState(){
 /* ---------- animation loop (levels, counters) ---------------------- */
 function tick(){
   requestAnimationFrame(tick);
-  if(view !== 'room' || !S) return;
+  if(!((view === 'room' && S) || (view === 'mini' && rec))) return;
   const ac = AC; let lvl = 0;
   if(bot && ac){
     const t = ac.currentTime, b = bot, pre = t < b.sch.verseStart, cnt = $('#botcount'), box = $('#botbars');
@@ -1033,10 +1056,245 @@ function tick(){
     lvl = pos >= 0 && i < p.env.length ? clamp(p.env[i] * 5, 0, 1) : 0;
     const pr = $('#playprog'); if(pr) pr.style.width = clamp(pos / p.dur * 100, 0, 100) + '%';
   } else if(micTest){ lvl = clamp(micTest.level * 6, 0, 1); }
-  else if(S.phase === 'battle' && recLive()){ lvl = .2 + .35 * Math.abs(Math.sin(performance.now() / 140)); }
+  else if(S && S.phase === 'battle' && recLive()){ lvl = .2 + .35 * Math.abs(Math.sin(performance.now() / 140)); }
   document.documentElement.style.setProperty('--lvl', lvl.toFixed(3));
 }
 requestAnimationFrame(tick);
+
+/* ---------- mini games: quick solo practice, with points and badges ----
+   Random words, Quick round and Rhyme rush. Everything runs on this
+   device; points and badges are kept in this browser.                 */
+const WORDS = {
+  en: ['pizza','rocket','dragon','homework','banana','sneakers','robot','ocean','pancake','thunder','puppy','castle','volcano','skateboard','ninja','rainbow',
+       'spaceship','cookie','jungle','football','teacher','monster','guitar','snowman','pirate','unicorn','burger','lightning','dinosaur','bicycle','treasure',
+       'alien','penguin','superhero','popcorn','waterfall','zombie','crown','laser','galaxy'],
+  et: ['pitsa','rakett','draakon','kodutöö','banaan','tossud','robot','meri','pannkook','äike','kutsikas','loss','vulkaan','rula','ninja','vikerkaar',
+       'kosmoselaev','küpsis','džungel','jalgpall','õpetaja','koletis','kitarr','lumememm','piraat','ükssarv','burger','välk','dinosaurus','jalgratas','aare',
+       'tulnukas','pingviin','superkangelane','popkorn','juga','zombi','kroon','laser','galaktika']
+};
+const RHYMES = {
+  en: {
+    cat:  { ends:['at'], words:['bat','hat','mat','rat','sat','fat','flat','chat','that','splat','pat','acrobat'] },
+    day:  { ends:['ay','ey','eigh'], words:['play','say','way','stay','may','pay','ray','gray','they','hey','weigh','okay','today','away','hooray'] },
+    light:{ ends:['ight','ite'], words:['night','right','bright','fight','kite','bite','white','write','height','flight','tonight','byte'] },
+    star: { ends:['ar'], words:['car','far','bar','jar','guitar','are','superstar','radar'] },
+    game: { ends:['ame','aim'], words:['name','same','fame','frame','flame','came','blame','aim','claim'] },
+    cool: { ends:['ool','ule','uel'], words:['school','pool','tool','rule','fool','drool','fuel','mule'] },
+    beat: { ends:['eat','eet','ete'], words:['feet','street','sweet','meet','heat','seat','treat','neat','complete','repeat'] },
+    sky:  { ends:['igh','ie','uy','ye'], words:['my','by','fly','try','why','cry','dry','shy','spy','fry','high','guy','bye','eye','pie','tie','hi','goodbye','reply'] },
+    ball: { ends:['all','awl','aul'], words:['call','fall','hall','tall','wall','small','mall','crawl','haul'] },
+    rain: { ends:['ain','ane'], words:['train','brain','chain','main','plane','lane','again','explain'] },
+    fun:  { ends:['un'], words:['sun','run','one','done','ton','won','none','bun','begun','everyone'] },
+    mic:  { ends:['ike','yke'], words:['like','bike','hike','strike','spike','psych'] }
+  },
+  et: {
+    kass: { ends:['ass'], words:['mass','pass','klass','bass','tass','jass'] },
+    lill: { ends:['ill'], words:['pill','till','vill','sill','grill'] },
+    'öö': { ends:['öö'], words:['töö','söö','löö','kodutöö'] },
+    kuu:  { ends:['uu'], words:['suu','puu','luu','muu'] },
+    biit: { ends:['iit'], words:['riit','siit','viit','liit','kriit','eliit'] },
+    'räpp': { ends:['äpp'], words:['täpp','käpp','näpp'] },
+    pall: { ends:['all'], words:['sall','hall','vall','kall','trall','jalgpall'] },
+    suur: { ends:['uur'], words:['juur','muur','kuur','tuur','kontuur'] },
+    kool: { ends:['ool'], words:['pool','vool','hool','sool'] },
+    hea:  { ends:['ea'], words:['pea','tea'] }
+  }
+};
+const RUSH_SECONDS = 20, ROBOT_RHYMES = { easy:2, normal:4, expert:6 };
+const BADGES = {
+  first:  'First mini game',
+  wizard: 'Word wizard: all 3 words in one verse',
+  fire:   'On fire: 25 or more from Boombot in a quick round',
+  machine:'Rhyme machine: 6 rhymes in one rush',
+  robo:   'Robot beater: beat DJ Megabyte at Rhyme rush',
+  p100:   '100 points', p500:'500 points', p1000:'1000 points'
+};
+let pts = Object.assign({ total:0, best:{ words:0, quick:0, rush:0 }, badges:[] }, store.get('rr.pts', {}));
+let miniSet = Object.assign({ lang:'en', beat:'boom', level:'normal' }, store.get('rr.mini', {}));
+if(!BEATS[miniSet.beat]) miniSet.beat = 'boom'; if(!RHYMES[miniSet.lang]) miniSet.lang = 'en'; if(!ROBOTS[miniSet.level]) miniSet.level = 'normal';
+let mini = null;   // { game, stage, ... }
+
+function award(points, game, score, extra){
+  const out = { points, newBest:false, badges:[] };
+  pts.total += points;
+  if(score > (pts.best[game] || 0)){ pts.best[game] = score; out.newBest = true; }
+  const give = id => { if(!pts.badges.includes(id)){ pts.badges.push(id); out.badges.push(id); } };
+  give('first'); (extra || []).forEach(give);
+  if(pts.total >= 100) give('p100'); if(pts.total >= 500) give('p500'); if(pts.total >= 1000) give('p1000');
+  store.set('rr.pts', pts); return out;
+}
+const pickWords = lang => { const l = WORDS[lang], out = []; while(out.length < 3){ const w = l[rnd(l.length)]; if(!out.includes(w)) out.push(w); } return out; };
+const barsFor30 = beat => clamp(Math.round(30 / (240 / BEATS[beat].bpm)), 4, 16);
+function openMini(game){
+  stopAudio(); audio();
+  mini = { game, stage:'intro' };
+  if(game === 'words') mini.words = pickWords(miniSet.lang);
+  view = 'mini'; render(); scrollTo(0, 0);
+}
+async function miniRecord(){
+  if(rec || !mini) return;
+  stopAudio();
+  const ac = audio(); let mic;
+  try{ mic = await openMic(); }catch(e){ return toast(micHelp(e), 7000); }
+  if(!mini || view !== 'mini'){ mic.close(); return; }
+  const beat = miniSet.beat, bars = mini.game === 'quick' ? 4 : barsFor30(beat);
+  const out = ac.createGain(); out.gain.value = .8; out.connect(MASTER);
+  const sch = scheduleBeat(ac, out, beat, ac.currentTime + .45, bars, true);
+  const lat = clamp((ac.outputLatency || 0) + (ac.baseLatency || 0) + mic.inLat, 0, .35);
+  mic.chunks = [];
+  rec = { mic, out, sch, lat, beat, bars, done:false, mini:true };
+  rec.timer = setTimeout(() => finishVerse(), (sch.end + lat - ac.currentTime) * 1000 + 180);
+  mini.stage = 'rec'; render();
+}
+function finishMini(){
+  const r = rec; if(!r || r.done) return; r.done = true; clearTimeout(r.timer);
+  const ac = audio(), sr = ac.sampleRate, endT = Math.min(ac.currentTime, r.sch.end + r.lat);
+  try{ r.out.disconnect(); }catch{}
+  const chunks = r.mic.chunks; r.mic.chunks = null; r.mic.close();
+  const f0 = Math.round((r.sch.verseStart + r.lat) * sr), n = Math.max(0, Math.round(endT * sr) - f0);
+  rec = null;
+  if(!mini) return;
+  if(n < sr * 1.5){ mini.stage = 'intro'; toast('That was too short to count. Try again!'); render(); return; }
+  const x = new Float32Array(n);
+  for(const { f, b } of chunks){ const off = f - f0; if(off >= n || off + b.length <= 0) continue;
+    const a = Math.max(0, -off), z = Math.min(b.length, n - off); x.set(b.subarray(a, z), off + a); }
+  const y = downsample(x, sr, RATE), j = judgeVerse(y, BEATS[r.beat].bpm, r.bars);
+  let pk = 0; for(let i = 0; i < y.length; i++){ const a = Math.abs(y[i]); if(a > pk) pk = a; }
+  if(pk > .02){ const g = Math.min(8, .92 / pk); for(let i = 0; i < y.length; i++) y[i] *= g; }
+  const id = 'mini' + rid(6); clips.set(id, makeClip(muEncode(y)));
+  mini.take = { id, beat:r.beat, bars:clamp(Math.ceil((y.length / RATE) / r.sch.bar - .02), 1, r.bars) };
+  mini.judge = { flow:c10(j.flow), energy:c10(j.energy), stamina:c10(j.stamina) };
+  mini.stage = 'done'; mini.used = [];
+  if(mini.game === 'quick'){ const sc = mini.judge.flow + mini.judge.energy + mini.judge.stamina; mini.result = award(sc, 'quick', sc, sc >= 25 ? ['fire'] : []); }
+  render();
+}
+function collectWords(){
+  if(!mini || mini.result) return;
+  const sc = mini.judge.flow + mini.judge.energy + mini.judge.stamina + mini.used.length * 10;
+  mini.result = award(sc, 'words', sc, mini.used.length === 3 ? ['wizard'] : []); render();
+}
+// Rhyme rush
+const normWord = s => String(s || '').toLowerCase().trim().replace(/[^a-zäöüõšž]/g, '');
+function rhymes(target, w){
+  const t = RHYMES[miniSet.lang][target]; if(!t || !w || w === target) return false;
+  return t.words.includes(w) || t.ends.some(e => w.length > e.length && w.endsWith(e));
+}
+function startRush(){
+  const keys = Object.keys(RHYMES[miniSet.lang]);
+  let target; do target = keys[rnd(keys.length)]; while(mini.target === target && keys.length > 1);
+  Object.assign(mini, { stage:'go', target, typed:[], ends:Date.now() + RUSH_SECONDS * 1000, result:null });
+  render(); const i = $('#rushin'); if(i) i.focus();
+  clearInterval(mini.timer);
+  mini.timer = setInterval(() => {
+    if(!mini || mini.stage !== 'go'){ clearInterval(mini && mini.timer); return; }
+    const left = Math.max(0, mini.ends - Date.now()), b = $('#rushbar'), t = $('#rushleft');
+    if(b) b.style.width = (left / (RUSH_SECONDS * 1000) * 100) + '%'; if(t) t.textContent = Math.ceil(left / 1000) + ' s';
+    if(left <= 0) endRush();
+  }, 100);
+}
+function addRhyme(raw){
+  if(!mini || mini.stage !== 'go') return;
+  const w = normWord(raw); if(!w || mini.typed.some(x => x.w === w)) return;
+  mini.typed.push({ w, ok:rhymes(mini.target, w) });
+  const list = $('#rushlist'); if(list) list.innerHTML = rushChips();
+}
+function endRush(){
+  if(!mini || mini.stage !== 'go') return;
+  clearInterval(mini.timer);
+  const t = RHYMES[miniSet.lang][mini.target], mine = mini.typed.filter(x => x.ok).map(x => x.w);
+  const pool = t.words.filter(w => !mine.includes(w)), botN = Math.min(ROBOT_RHYMES[miniSet.level], t.words.length), bot = [];
+  while(bot.length < botN && pool.length) bot.push(pool.splice(rnd(pool.length), 1)[0]);
+  while(bot.length < botN){ const w = t.words[rnd(t.words.length)]; if(!bot.includes(w)) bot.push(w); }
+  const win = mine.length > bot.length, extra = [];
+  if(mine.length >= 6) extra.push('machine'); if(win && miniSet.level === 'expert') extra.push('robo');
+  mini.bot = bot; mini.stage = 'done';
+  mini.result = award(mine.length * 5 + (win ? 10 : 0), 'rush', mine.length, extra);
+  render();
+}
+const rushChips = () => mini.typed.map(x => `<span class="rw ${x.ok ? 'ok' : 'no'}">${esc(x.w)}</span>`).join('') || '<span class="small">Your rhymes show up here.</span>';
+
+/* mini game screens */
+function miniCard(){
+  return `<section class="card"><div class="row" style="justify-content:space-between"><h2>Mini games</h2><span class="pill tot">${pts.total} points</span></div>
+    <div class="minis">
+      <button class="mg" data-act="mini" data-game="words"><b>Random words</b><span>Get 3 words and rap them into a 30-second verse.</span></button>
+      <button class="mg" data-act="mini" data-game="quick"><b>Quick round</b><span>4 lines, one take. Beat your best score.</span></button>
+      <button class="mg" data-act="mini" data-game="rush"><b>Rhyme rush</b><span>${RUSH_SECONDS} seconds: type as many rhymes as you can against the robot.</span></button>
+    </div>
+    ${pts.badges.length ? `<div class="badgelist">${pts.badges.map(b => `<span class="badge you" title="${esc(BADGES[b] || b)}">${esc((BADGES[b] || b).split(':')[0])}</span>`).join('')}</div>` : '<p class="small">Play to earn points and badges.</p>'}</section>`;
+}
+function miniStat(label, n){ return `<div class="stat"><span>${label}</span><span class="bar"><i style="width:${n * 10}%"></i></span><span class="n">${n}</span></div>`; }
+function resultBox(){
+  const r = mini.result; if(!r) return '';
+  return `<div class="won"><div class="plus">+${r.points} points</div>${r.newBest ? '<div class="nb">New personal best!</div>' : ''}
+    ${r.badges.map(b => `<div class="nbadge">New badge: ${esc(BADGES[b])}</div>`).join('')}<span class="small">Total: ${pts.total} points</span></div>`;
+}
+function miniChips(k, list){ return list.map(([v, l]) => `<button class="chip" aria-pressed="${miniSet[k] === v}" data-act="miniset" data-k="${k}" data-v="${v}">${l}</button>`).join(''); }
+const beatChips = () => miniChips('beat', Object.entries(BEATS).map(([id, b]) => [id, b.name]));
+const langChips = () => miniChips('lang', [['en', 'English'], ['et', 'Eesti keel']]);
+function recPanel(){
+  return `<div id="recbox" style="display:grid;gap:14px;justify-items:center;width:100%">
+    <span class="onair">Mic is on</span><div id="reccount" class="count">4</div>
+    <div id="recbars" style="display:grid;gap:12px;width:100%;justify-items:center" hidden>
+      <div class="bars" id="recbar">Bar 1</div><div class="dots" id="recdots"><b></b><b></b><b></b><b></b></div><div class="track"><i id="recprog"></i></div></div>
+    <div class="meter"><i></i></div><button class="btn mini" data-act="done">I'm done</button></div>`;
+}
+function takeControls(){
+  const now = playing && playing.id === mini.take.id;
+  return `<button class="btn teal mini" data-act="miniplay">${now ? 'Start over' : 'Play it back'}</button>`;
+}
+function miniView(){
+  const m = mini, back = '<div class="center"><button class="btn mini" data-act="minihome">Back</button></div>';
+  if(m.game === 'words'){
+    const words = `<div class="wordrow">${m.words.map(w => `<span class="bigword">${esc(w)}</span>`).join('')}</div>`;
+    if(m.stage === 'intro') return `<section class="card"><h2>Random words</h2><p>Rap a verse that uses all three words. You get about 30 seconds over the beat.</p>${words}
+        <div class="row"><button class="btn mini sun" data-act="newwords">New words</button></div>
+        <div class="group"><span class="lab">Words in</span><div class="opts">${langChips()}</div></div>
+        <div class="group"><span class="lab">Beat</span><div class="opts">${beatChips()}</div></div></section>
+      <button class="btn pink big" data-act="minirec">Drop the beat</button>${back}`;
+    if(m.stage === 'rec') return `<section class="panel stagepanel">${words}${recPanel()}</section>`;
+    const sc = m.judge.flow + m.judge.energy + m.judge.stamina;
+    return `<section class="card"><h2>How did it go?</h2>${words}
+        <div class="group"><span class="lab">${m.result ? 'Words you used' : 'Tap the words you got into your verse'}</span><div class="opts">${m.words.map(w => `<button class="chip" aria-pressed="${m.used.includes(w)}" ${m.result ? 'disabled' : `data-act="usedword" data-w="${esc(w)}"`}>${esc(w)}</button>`).join('')}</div></div>
+        <div class="judge"><div class="who"><span class="bot">${BOT_SVG}</span><div class="grow"><span class="lab">Boombot says</span><div style="font-weight:700">${esc(judgeSays(m.judge))}</div></div></div>
+          ${miniStat('Flow', m.judge.flow)}${miniStat('Energy', m.judge.energy)}${miniStat('Stamina', m.judge.stamina)}
+          <div class="sum"><span class="pill">Boombot ${sc}/30</span><span class="pill">Words ${m.used.length * 10}/30</span><span class="pill tot">${sc + m.used.length * 10} points</span></div></div>
+        <div class="row">${takeControls()}</div>
+        ${m.result ? resultBox() : '<button class="btn pink big" data-act="collect">Collect points</button>'}</section>
+      ${m.result ? '<button class="btn pink big" data-act="miniagain">New words, go again</button>' : ''}${back}`;
+  }
+  if(m.game === 'quick'){
+    if(m.stage === 'intro') return `<section class="card"><h2>Quick round</h2><p>4 lines over the beat, one take, no do-overs. A good warm-up before a battle.</p>
+        <p class="small">Your best: ${pts.best.quick || 0} of 30.</p>
+        <div class="group"><span class="lab">Beat</span><div class="opts">${beatChips()}</div></div></section>
+      <button class="btn pink big" data-act="minirec">Drop the beat</button>${back}`;
+    if(m.stage === 'rec') return `<section class="panel stagepanel">${recPanel()}</section>`;
+    return `<section class="card"><h2>Quick round done</h2>
+        <div class="judge"><div class="who"><span class="bot">${BOT_SVG}</span><div class="grow"><span class="lab">Boombot says</span><div style="font-weight:700">${esc(judgeSays(m.judge))}</div></div></div>
+          ${miniStat('Flow', m.judge.flow)}${miniStat('Energy', m.judge.energy)}${miniStat('Stamina', m.judge.stamina)}</div>
+        <div class="row">${takeControls()}</div>${resultBox()}<p class="small">Your best: ${pts.best.quick} of 30.</p></section>
+      <button class="btn pink big" data-act="miniagain">Go again</button>${back}`;
+  }
+  // rush
+  const R = ROBOTS[miniSet.level];
+  if(m.stage === 'intro') return `<section class="card"><h2>Rhyme rush</h2><p>You get one word. Type as many words that rhyme with it as you can in ${RUSH_SECONDS} seconds. Press Enter after each one.</p>
+      <div class="group"><span class="lab">Language</span><div class="opts">${langChips()}</div></div>
+      <div class="group"><span class="lab">Robot</span><div class="opts">${miniChips('level', Object.entries(ROBOTS).map(([id, r]) => [id, `${r.label} · ${r.name}`]))}</div></div>
+      <p class="small">Your best: ${pts.best.rush || 0} rhymes.</p></section>
+    <button class="btn pink big" data-act="rushgo">Start</button>${back}`;
+  if(m.stage === 'go') return `<section class="card rush"><span class="lab">Rhyme with</span><div class="target">${esc(m.target)}</div>
+      <div class="track light"><i id="rushbar" style="width:100%"></i></div><span class="small" id="rushleft">${RUSH_SECONDS} s</span>
+      <form class="row" data-form="rush"><input id="rushin" class="field grow" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="send" placeholder="Type a rhyme">
+        <button class="btn sun" type="submit">Add</button></form>
+      <div class="rwlist" id="rushlist">${rushChips()}</div></section>`;
+  const mine = m.typed.filter(x => x.ok).length, botN = m.bot.length;
+  return `<section class="card"><h2>${mine > botN ? 'You beat the robot!' : mine === botN ? 'A tie with the robot' : `${esc(R.name)} wins this one`}</h2>
+      <span class="lab">Rhymes with</span><div class="target small-t">${esc(m.target)}</div>
+      <div class="vsrow"><div><span class="lab">You · ${mine}</span><div class="rwlist">${rushChips()}</div></div>
+        <div><span class="lab">${esc(R.name)} · ${botN}</span><div class="rwlist">${m.bot.map(w => `<span class="rw ok">${esc(w)}</span>`).join('')}</div></div></div>
+      <p class="small">Crossed-out words did not count. Each rhyme is 5 points, and beating the robot adds 10.</p>${resultBox()}</section>
+    <button class="btn pink big" data-act="rushgo">New word, go again</button>${back}`;
+}
 
 /* ---------- screens ------------------------------------------------ */
 const fmtDay = d => d ? d.toLocaleDateString(undefined, { weekday:'short', day:'numeric', month:'short' }) : '';
@@ -1045,6 +1303,7 @@ function render(){
   if(view === 'home') h = homeView();
   else if(view === 'creator') h = creatorView();
   else if(view === 'solo') h = soloView();
+  else if(view === 'mini' && mini) h = miniView();
   else if(view === 'busy') h = `<div class="busy"><div class="spin"></div><h2>${esc(busyText)}</h2><div><button class="btn mini" data-act="home">Cancel</button></div></div>`;
   else if(view === 'room' && S) h = S.phase === 'lobby' ? lobbyView() : S.phase === 'battle' ? battleView() : resultsView();
   document.body.classList.toggle('stage', view === 'room' && !!S && S.phase !== 'lobby');
@@ -1070,6 +1329,7 @@ function homeView(){
       <form class="row" data-form="join"><input id="code" class="field code grow" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDEF" value="${esc(joinCode)}">
       <button class="btn sun" type="submit">Join</button></form></div>
   </section>
+  ${miniCard()}
   <section class="card">
     <h2>How a battle works</h2>
     <ol class="steps">
@@ -1292,6 +1552,16 @@ document.addEventListener('click', e => {
     case 'robotgo': robotGo(); break;
     case 'download': (async () => { if(dlBusy) return; dlBusy = true; render(); try{ const b = await renderBattle(); if(b) saveBlob(b); else toast('There are no recorded verses to save.'); }catch(err){ console.warn(err); toast('Could not make the sound file on this device.'); } dlBusy = false; render(); })(); break;
     case 'send': sendBattle(); break;
+    case 'mini': openMini(el.dataset.game); break;
+    case 'minihome': stopAudio(); abortRec(); if(mini) clearInterval(mini.timer); mini = null; view = 'home'; render(); scrollTo(0, 0); break;
+    case 'miniset': { const k = el.dataset.k; miniSet[k] = el.dataset.v; store.set('rr.mini', miniSet); if(k === 'beat') previewBeat(el.dataset.v); if(k === 'lang' && mini && mini.game === 'words') mini.words = pickWords(miniSet.lang); render(); break; }
+    case 'newwords': mini.words = pickWords(miniSet.lang); render(); break;
+    case 'minirec': miniRecord(); break;
+    case 'miniplay': audio(); playVerse(mini.take); break;
+    case 'usedword': { const w = el.dataset.w, u = mini.used; if(u.includes(w)) u.splice(u.indexOf(w), 1); else u.push(w); render(); break; }
+    case 'collect': collectWords(); break;
+    case 'miniagain': stopAudio(); mini = { game:mini.game, stage:'intro', words:mini.game === 'words' ? pickWords(miniSet.lang) : null }; render(); scrollTo(0, 0); break;
+    case 'rushgo': audio(); startRush(); break;
     case 'copylink': { const v = shareLink(); navigator.clipboard.writeText(v).then(() => toast('Link copied.'), () => { const i = $('#sharelink'); if(i){ i.select(); } toast('Select the link and copy it.'); }); break; }
     case 'battleme': createRoom(); break;
     case 'invite': invite(); break;
@@ -1319,7 +1589,9 @@ document.addEventListener('input', e => {
   if(e.target.id === 'rapname' && draft) draft.name = e.target.value;
   if(e.target.id === 'code'){ joinCode = e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6); }
 });
-document.addEventListener('submit', e => { e.preventDefault(); if(e.target.dataset.form === 'join') goRoom($('#code').value); });
+document.addEventListener('submit', e => { e.preventDefault();
+  if(e.target.dataset.form === 'join') goRoom($('#code').value);
+  if(e.target.dataset.form === 'rush'){ const i = $('#rushin'); addRhyme(i.value); i.value = ''; i.focus(); } });
 window.addEventListener('hashchange', () => { const c = (location.hash || '').replace(/[^A-Za-z]/g, '').toUpperCase(); if(c.length === 6 && c !== roomCode) goRoom(c); });
 
 /* ---------- boot --------------------------------------------------- */
