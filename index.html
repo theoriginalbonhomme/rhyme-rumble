@@ -163,6 +163,16 @@ button.tile{cursor:pointer}
 .lost{background:var(--pink); color:var(--ink); border:3px solid var(--ink); border-radius:14px; padding:10px 14px; font-weight:700; text-align:center}
 .botline{font-family:var(--display); font-size:clamp(1.15rem,5.2vw,1.6rem); line-height:1.25; color:var(--sun); text-wrap:balance; min-height:2.5em}
 .lyrics{width:100%; text-align:left; background:#150A30; border:3px solid #000; border-radius:14px; padding:12px 14px; font-weight:500; line-height:1.5}
+.mlab{color:#CFC4F2}
+.card .mlab{color:var(--muted)}
+.rooms{display:grid; gap:10px}
+.roomrow{display:flex; gap:12px; align-items:center; text-align:left; width:100%; padding:10px 12px; background:#fff; border:3px solid var(--ink); border-radius:14px; cursor:pointer; color:var(--ink)}
+.roomrow.hot{background:var(--sun); box-shadow:4px 4px 0 var(--ink)}
+.roomrow .rc{font-family:var(--display); letter-spacing:.08em; font-size:1.05rem; flex:none}
+.roomrow .rs{display:grid; min-width:0; font-size:.9rem; line-height:1.3}
+.roomrow .rs span{color:var(--muted); overflow-wrap:anywhere}
+.panel + .panel{margin-top:0}
+.share .row a{text-decoration:none}
 #toast{position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 18px); margin:0 auto; max-width:520px; z-index:20;
   background:var(--ink); color:var(--paper); border:3px solid var(--paper); border-radius:14px; padding:12px 16px; font-weight:500; text-align:center; overflow-wrap:anywhere}
 .busy{min-height:55vh; display:grid; place-content:center; gap:16px; text-align:center}
@@ -180,8 +190,8 @@ button.tile{cursor:pointer}
 "use strict";
 /* =====================================================================
    RHYME RUMBLE
-   One file, no installs. Players exchange encrypted messages through
-   public relay servers; the room's host device keeps the game state.
+   One file, no installs. Online rooms are kept on a small Supabase
+   database (see rhyme-rumble-setup.sql); the robot battle works offline.
    ===================================================================== */
 const GAME = 'Rhyme Rumble';
 const ROOM_PREFIX = 'rhyme-rumble-v1-';
@@ -436,329 +446,235 @@ function makeClip(pcm){ const f = muDecode(pcm); return { pcm, f, env:frameRms(f
 let me = store.get('rr.me', null);
 if(!me || !me.name) me = { name:randomName(), av:randomAv() };
 me.av = cleanAv(me.av); me.name = cleanName(me.name);
-// the player id lives per tab, so two tabs on one computer count as two players
+// a local id for solo play; online rooms give each device its own id per room
 try{ me.pid = sessionStorage.getItem('rr.pid') || rid(12); sessionStorage.setItem('rr.pid', me.pid); }catch{ me.pid = rid(12); }
 store.set('rr.me', { name:me.name, av:me.av });
 
-/* ---------- app + network state ------------------------------------ */
-let view = 'home';             // home | creator | busy | room
+/* ---------- app state ---------------------------------------------- */
+let view = 'home';             // home | creator | solo | busy | room
 let busyText = '', draft = null, creatorBack = 'home';
-let isHost = false, S = null, roomCode = '';
+let S = null, roomCode = '', ver = 0, closesAt = null, roomClosed = false, myRoom = false;
 const clips = new Map();       // verse id -> {pcm, f, env}
 const autoPlayed = new Set(), heard = new Set();
-let playing = null, rec = null, liveLevel = 0, micTest = null, wake = null, joinCode = '', lost = false;
+let playing = null, rec = null, micTest = null, wake = null, joinCode = '', lost = false, sending = null, recent = [];
 
-/* ---------- network: encrypted messages over public relay servers ----
-   Every device talks to the same relay servers over a normal secure
-   web connection, so it works on home Wi-Fi and mobile data alike.
-   Messages are encrypted with a key made from the room code. The
-   host device keeps the game state; everyone else follows it.        */
-const BROKERS = ['wss://test.mosquitto.org:8081/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
-const DEV_RELAY = new URLSearchParams(location.search).get('relay');     // dev only: ?relay=ws://127.0.0.1:1884
-const CHUNK = 30000;
-const te = new TextEncoder(), td = new TextDecoder();
+/* ---------- online rooms: stored on the server ------------------------
+   A room lives in the database, not on anyone's phone, so it stays open
+   when people leave. Battles can be live or happen over days: each player
+   records their verse whenever they like and the room shows whose turn it
+   is. Every change is saved with a version number; if two people change
+   the room at the same moment, the second one simply tries again.      */
+const DB_URL = 'https://wweocpquhafdaictjxei.supabase.co';          // e.g. https://abcdefghijkl.supabase.co
+const DB_KEY = 'sb_publishable_QCQtT_4vOfIp_hJdDXyW9g_KPL_SiyE';      // Supabase: Project Settings -> API Keys -> publishable key
+const DEV_DB = new URLSearchParams(location.search).get('db');   // testing only: ?db=http://127.0.0.1:3000
+const API = DEV_DB || (DB_URL.startsWith('http') ? DB_URL.replace(/\/+$/, '') + '/rest/v1' : '');
+const PART = 150000;           // a recording is uploaded in parts of this many bytes
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-function mqStr(s){ const b = te.encode(s), o = new Uint8Array(b.length + 2); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; }
-function mqPacket(type, parts){
-  let n = 0; for(const p of parts) n += p.length;
-  const head = [type]; let r = n; do { let d = r % 128; r = Math.floor(r / 128); if(r) d |= 128; head.push(d); } while(r);
-  const o = new Uint8Array(head.length + n); o.set(head, 0); let k = head.length; for(const p of parts){ o.set(p, k); k += p.length; } return o;
+async function rpc(fn, args){
+  if(!API) throw Object.assign(new Error('not set up'), { code:'setup' });
+  const h = { 'Content-Type':'application/json' };
+  if(!DEV_DB){ h.apikey = DB_KEY; if(DB_KEY.startsWith('eyJ')) h.Authorization = 'Bearer ' + DB_KEY; }
+  let res;
+  try{ res = await fetch(API + '/rpc/' + fn, { method:'POST', headers:h, body:JSON.stringify(args) }); }
+  catch(e){ throw Object.assign(new Error('offline'), { code:'offline' }); }
+  if(!res.ok){ const t = await res.text().catch(() => ''); console.warn(fn, res.status, t); throw Object.assign(new Error('server ' + res.status), { code:'server' }); }
+  const t = await res.text(); return t ? JSON.parse(t) : null;
 }
-class Link {                       // a very small MQTT client: connect, subscribe, publish, keep alive
-  constructor(url, onmsg){ this.url = url; this.onmsg = onmsg; this.subs = new Set(); this.ready = false; this.dead = false; this.buf = new Uint8Array(0); this.pid = 1; this.lastRx = 0; this.open(); }
-  open(){
-    if(this.dead) return; let ws;
-    try{ ws = this.ws = new WebSocket(this.url, 'mqtt'); }catch{ return this.retry(); }
-    ws.binaryType = 'arraybuffer'; this.buf = new Uint8Array(0);
-    ws.onopen = () => { try{ ws.send(mqPacket(0x10, [mqStr('MQTT'), new Uint8Array([4, 2, 0, 45]), mqStr('rr' + rid(12))])); }catch{} };
-    ws.onmessage = e => { this.lastRx = Date.now(); this.feed(new Uint8Array(e.data)); };
-    ws.onclose = () => { if(this.ws !== ws) return; this.ready = false; clearInterval(this.ping); this.retry(); };
-    ws.onerror = () => {};
-  }
-  retry(){ if(!this.dead){ clearTimeout(this.rt); this.rt = setTimeout(() => this.open(), 1500); } }
-  feed(d){
-    const b = new Uint8Array(this.buf.length + d.length); b.set(this.buf); b.set(d, this.buf.length); let p = 0;
-    for(;;){
-      if(b.length - p < 2) break;
-      let len = 0, mul = 1, i = p + 1, ok = false;
-      while(i < b.length && i < p + 5){ const x = b[i++]; len += (x & 127) * mul; mul *= 128; if(!(x & 128)){ ok = true; break; } }
-      if(!ok || b.length - i < len) break;
-      try{ this.packet(b[p], b.subarray(i, i + len)); }catch{}
-      p = i + len;
-    }
-    this.buf = b.slice(p);
-  }
-  packet(h, body){
-    const t = h >> 4;
-    if(t === 2){ if(body[1] !== 0) return;
-      this.ready = true; for(const s of this.subs) this.sendSub(s);
-      clearInterval(this.ping);
-      this.ping = setInterval(() => { if(Date.now() - this.lastRx > 50000){ try{ this.ws.close(); }catch{} } else try{ this.ws.send(new Uint8Array([0xC0, 0])); }catch{} }, 15000);
-    } else if(t === 3){ const tl = (body[0] << 8) | body[1], topic = td.decode(body.subarray(2, 2 + tl)); let o = 2 + tl; if(h & 6) o += 2; this.onmsg(topic, body.slice(o)); }
-  }
-  sendSub(t){ const id = this.pid = (this.pid % 65000) + 1; try{ this.ws.send(mqPacket(0x82, [new Uint8Array([id >> 8, id & 255]), mqStr(t), new Uint8Array([0])])); }catch{} }
-  sub(t){ this.subs.add(t); if(this.ready) this.sendSub(t); }
-  pub(t, payload){ if(!this.ready) return false; try{ this.ws.send(mqPacket(0x30, [mqStr(t), payload])); return true; }catch{ return false; } }
-  wake(){ if(!this.dead && (!this.ws || this.ws.readyState > 1)){ clearTimeout(this.rt); this.open(); } }
-  close(){ this.dead = true; this.ready = false; clearInterval(this.ping); clearTimeout(this.rt); try{ this.ws.send(new Uint8Array([0xE0, 0])); }catch{} try{ this.ws.close(); }catch{} }
-}
-const net = { links:[], key:null, topic:'', gen:0, seq:0, sid:rid(4), q:Promise.resolve(), rq:Promise.resolve(), seen:new Set(), timer:null, tickN:0,
-  lastHost:0, lastSeen:new Map(), partial:new Map(), pendingVerse:new Map(), needAt:new Map(), outVerse:null, missSince:0, hiAt:0 };
+const netHelp = e => e && e.code === 'setup' ? 'Online rooms are not set up yet. The robot battle works already.'
+  : e && e.code === 'offline' ? 'No internet connection. Check it and try again.' : 'The game server did not answer. Try again in a moment.';
 
-async function roomKeys(code){
-  const base = await crypto.subtle.importKey('raw', te.encode('rhyme-rumble|' + code), 'PBKDF2', false, ['deriveBits']);
-  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name:'PBKDF2', salt:te.encode('rhyme-rumble-v2-salt'), iterations:150000, hash:'SHA-256' }, base, 384));
-  return { key:await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']),
-           topic:'rr2/' + Array.from(bits.slice(32, 44), b => b.toString(16).padStart(2, '0')).join('') };
+// who am I in each room: { pid, token } per room code, kept on this device
+function ident(code){
+  try{ const all = JSON.parse(localStorage.getItem('rr.ids') || '{}'); return all[code] || null; }catch{ return null; }
 }
-async function seal(key, obj, bin){
-  const j = te.encode(JSON.stringify(obj)), b = bin || new Uint8Array(0), plain = new Uint8Array(4 + j.length + b.length);
-  new DataView(plain.buffer).setUint32(0, j.length); plain.set(j, 4); plain.set(b, 4 + j.length);
-  const iv = crypto.getRandomValues(new Uint8Array(12)), ct = new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, plain));
-  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return out;
+function saveIdent(code, id){
+  try{ const all = JSON.parse(localStorage.getItem('rr.ids') || '{}'); all[code] = id; localStorage.setItem('rr.ids', JSON.stringify(all)); }catch{}
 }
-async function unseal(key, p){
-  try{
-    const plain = new Uint8Array(await crypto.subtle.decrypt({ name:'AES-GCM', iv:p.subarray(0, 12) }, key, p.subarray(12)));
-    const n = new DataView(plain.buffer).getUint32(0); return { m:JSON.parse(td.decode(plain.subarray(4, 4 + n))), bin:plain.slice(4 + n) };
-  }catch{ return null; }
+function rememberRoom(code){
+  recent = [code, ...store.get('rr.rooms', []).filter(c => c !== code)].slice(0, 8); store.set('rr.rooms', recent);
 }
-async function netOpen(code){
-  netClose();
-  if(!window.crypto || !crypto.subtle || !window.WebSocket) throw new Error('old');
-  const gen = net.gen, k = await roomKeys(code);
-  if(net.gen !== gen) throw new Error('cancelled');
-  net.key = k.key; net.topic = k.topic; net.seen = new Set();
-  net.links = (DEV_RELAY ? DEV_RELAY.split(',') : BROKERS).map(u => new Link(u, (t, p) => { if(net.gen === gen) net.rq = net.rq.then(() => onPacket(gen, t, p)).catch(() => {}); }));
-  for(const l of net.links) l.sub(net.topic + (isHost ? '/h' : '/a'));
-  const t0 = Date.now();
-  while(!net.links.some(l => l.ready)){
-    if(net.gen !== gen) throw new Error('cancelled');
-    if(Date.now() - t0 > 14000) throw new Error('offline');
-    await sleep(120);
-  }
-}
-function netClose(){
-  net.gen++; clearInterval(net.timer); net.timer = null;
-  const old = net.links, q = net.q; net.links = []; net.key = null;
-  q.then(() => setTimeout(() => old.forEach(l => l.close()), 400));
-  net.lastSeen.clear(); net.partial.clear(); net.pendingVerse.clear(); net.needAt.clear(); net.outVerse = null; net.missSince = 0;
-}
-// to: 'h' = to the host, 'a' = from the host to everyone.  mode: 'heavy' (voice chunks), 'light' (level meter)
-function netSend(to, obj, bin, mode){
-  const key = net.key, links = net.links, topic = net.topic + '/' + to; if(!key) return;
-  const m = { ...obj, _f:me.pid, _z:net.sid, _n:++net.seq };      // envelope fields are underscored so they never clash with message fields
-  net.q = net.q.then(async () => {
-    const p = await seal(key, m, bin); let ls = links.filter(l => l.ready);
-    if(mode === 'light') ls = ls.slice(0, 1); else if(mode === 'heavy') ls = ls.slice(0, 2);
-    for(const l of ls) l.pub(topic, p);
-    if(mode === 'heavy' || mode === 'resend'){ let w = 0; do await sleep(45); while(ls.some(l => l.ws && l.ws.bufferedAmount > 150000) && ++w < 120); }
-  }).catch(() => {});
-}
-async function onPacket(gen, topic, p){
-  const key = net.key; if(!key || net.gen !== gen) return;
-  const u = await unseal(key, p); if(!u || net.gen !== gen) return;
-  const m = u.m; if(!m || typeof m._f !== 'string' || m._f === me.pid) return;
-  const k = m._f + '|' + m._z + '|' + m._n; if(net.seen.has(k)) return; if(net.seen.size > 8000) net.seen.clear(); net.seen.add(k);
-  if(isHost){ if(topic.endsWith('/h')) hostNet(m, u.bin); } else if(topic.endsWith('/a')) guestNet(m, u.bin);
-}
-function startTick(){ clearInterval(net.timer); net.timer = setInterval(netTick, 2000); }
-
-/* voice clips travel in chunks; anything that goes missing is asked for again */
-function sendClip(to, id, pcm, only, mode = 'heavy'){
-  const of = Math.ceil(pcm.length / CHUNK);
-  for(let i = 0; i < of; i++) if(!only || only.includes(i)) netSend(to, { t:'vc', id, i, of }, pcm.subarray(i * CHUNK, (i + 1) * CHUNK), mode);
-}
-function rxChunk(m, bin){
-  const id = String(m.id || '').slice(0, 16), of = m.of | 0, i = m.i | 0;
-  if(!id || clips.has(id) || of < 1 || of > 45 || i < 0 || i >= of || !bin.length || bin.length > CHUNK) return;
-  let p = net.partial.get(id); if(!p || p.of !== of){ if(net.partial.size > 6) net.partial.clear(); p = { of, parts:new Array(of), got:0 }; net.partial.set(id, p); }
-  if(!p.parts[i]){ p.parts[i] = bin; p.got++; }
-  if(p.got < of) return;
-  const pcm = new Uint8Array(p.parts.reduce((a, b) => a + b.length, 0)); let o = 0; for(const x of p.parts){ pcm.set(x, o); o += x.length; }
-  net.partial.delete(id); clips.set(id, makeClip(pcm));
-  if(isHost){ const pv = net.pendingVerse.get(id); if(pv){ net.pendingVerse.delete(id); hostHandle(pv.pid, pv.m); } }
-  else { maybeAutoPlay(); render(); }
-}
-function askFor(id, to){
-  const p = net.partial.get(id), miss = p ? [...Array(p.of).keys()].filter(i => !p.parts[i]) : null;
-  netSend(isHost ? 'a' : 'h', { t:'need', id, to, miss });
-}
-function resendClip(m, to){
-  const id = String(m.id || ''), c = clips.get(id); if(!c) return;
-  const now = Date.now(); if(now - (net.needAt.get(id) || 0) < 2500) return; net.needAt.set(id, now);
-  const of = Math.ceil(c.pcm.length / CHUNK), only = Array.isArray(m.miss) && m.miss.length ? m.miss.filter(i => Number.isInteger(i) && i >= 0 && i < of) : null;
-  sendClip(to, id, c.pcm, only, 'resend');       // a resend goes out on every relay, in case the two sides share only one
-}
+function forgetRoom(code){ recent = store.get('rr.rooms', []).filter(c => c !== code); store.set('rr.rooms', recent); }
 
 const randCode = () => Array.from({ length:6 }, () => CODE_LETTERS[rnd(CODE_LETTERS.length)]).join('');
 function newState(code){
-  return { v:0, code, host:me.pid, players:{}, order:[], phase:'lobby', turn:null, verses:[],
+  return { code, host:me.pid, players:{}, order:[], phase:'lobby', verses:[], rec:null,
     set:{ beat:'boom', bars:8, rounds:2, a:null, b:null, topic:TOPICS[0] } };
 }
 function toast(msg, ms = 4200){ const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => t.hidden = true, ms); }
 function setBusy(text){ view = 'busy'; busyText = text; render(); }
-function netFail(e){
-  if(e && e.message === 'cancelled') return;
-  leave(true);
-  toast(e && e.message === 'old' ? 'This browser is too old for online play. Try the newest Chrome or Safari.' : 'Could not reach the game network. Check the internet connection and try again.', 8000);
-}
 
-async function createRoom(){
-  audio(); const code = randCode(); isHost = true; roomCode = code; setBusy('Opening your room…');
-  try{ await netOpen(code); }catch(e){ return netFail(e); }
-  S = newState(code); S.players[me.pid] = { name:me.name, av:me.av, on:true }; S.order = [me.pid];
+async function createRoom(code){
+  audio(); setBusy('Opening your room…');
+  const id = { pid:rid(12), token:rid(32) };
+  for(let i = 0; i < 4; i++){
+    const c = code && i === 0 ? code : randCode(), st = newState(c);
+    st.host = id.pid; st.players[id.pid] = { name:me.name, av:me.av }; st.order = [id.pid];
+    let r; try{ r = await rpc('rr_create', { p_code:c, p_pid:id.pid, p_token:id.token, p_state:st }); }
+    catch(e){ view = 'home'; render(); return toast(netHelp(e), 7000); }
+    if(r && r.error === 'taken') continue;
+    if(!r || r.error){ view = 'home'; render(); return toast('Could not open a room. Try again.'); }
+    saveIdent(c, id); me.pid = id.pid; if(view !== 'busy') return; return openRoom(c, st, r.version, r.closes_at);
+  }
+  view = 'home'; render(); toast('Could not open a room. Try again.');
+}
+function openRoom(code, st, v, closes){
+  stopAudio(); clips.clear(); autoPlayed.clear(); heard.clear();
+  S = st; ver = v; roomCode = code; closesAt = closes ? new Date(closes) : null; roomClosed = !!(closesAt && closesAt < new Date());
+  const id = ident(code); myRoom = !!(id && S.players[id.pid]); if(id) me.pid = id.pid;
+  if(myRoom) rememberRoom(code);
   try{ history.replaceState(null, '', '#' + code); }catch{}
-  view = 'room'; keepAwake(); startTick(); push();
+  view = 'room'; lost = false; keepAwake(); startPolling();
+  // a returning player sees what already happened: old verses count as heard
+  if(S.phase !== 'lobby') for(const x of S.verses.slice(0, -1)) heard.add(x.id), autoPlayed.add(x.id);
+  afterState(); scrollTo(0, 0);
 }
-function push(){ S.v++; netSend('a', { t:'state', s:S }); afterState(); }
-function send(m){ if(isHost) hostHandle(me.pid, m); else netSend('h', m); }
-function sayHi(){ const now = Date.now(); if(now - net.hiAt < 1000) return; net.hiAt = now; netSend('h', { t:'hi', name:me.name, av:me.av }); }
-
-async function joinRoom(raw){
+// open a room from a code or a link: rejoin if this device was in it, otherwise look at it first
+async function goRoom(raw){
   const code = String(raw || '').toUpperCase().replace(/[^A-Z]/g, '');
   if(code.length !== 6) return toast('Room codes have 6 letters.');
-  audio(); isHost = false; roomCode = code; setBusy('Finding room ' + code + '…');
-  try{ await netOpen(code); }catch(e){ return netFail(e); }
-  const gen = net.gen, t0 = Date.now(); net.lastHost = t0;
-  while(!S){
-    if(net.gen !== gen) return;
-    if(Date.now() - t0 > 15000){ leave(true); return toast('Could not find room ' + code + '. Check the code, and make sure the host still has the game open.', 9000); }
-    sayHi(); await sleep(1200);
-  }
+  audio(); setBusy('Finding room ' + code + '…');
+  let r; try{ r = await rpc('rr_get', { p_code:code, p_since:0 }); }catch(e){ if(view === 'busy'){ view = 'home'; render(); toast(netHelp(e), 7000); } return; }
+  if(view !== 'busy') return;                                    // the player pressed Cancel
+  if(!r || !r.state){ view = 'home'; render(); forgetRoom(code); return toast('Could not find room ' + code + '. Check the code.', 7000); }
+  const id = ident(code);
+  if(id){ try{ const j = await rpc('rr_join', { p_code:code, p_pid:id.pid, p_token:id.token }); if(j !== 'ok' && j !== 'closed') saveIdent(code, null); }catch{} }
+  openRoom(code, r.state, r.version, r.closes_at);
+  if(myRoom && !r.closed){ const p = r.state.players[me.pid]; if(p && (p.name !== me.name || JSON.stringify(p.av) !== JSON.stringify(me.av))) mutate(d => { if(!d.players[me.pid]) return false; d.players[me.pid] = { name:me.name, av:me.av }; }); }
 }
-function hostNet(m, bin){
-  if(!S) return; const pid = m._f.slice(0, 24); net.lastSeen.set(pid, Date.now());
-  switch(m.t){
-    case 'ping': if(!S.players[pid]) netSend('a', { t:'who', to:pid }); else if(!S.players[pid].on){ S.players[pid].on = true; push(); } break;
-    case 'bye': net.lastSeen.delete(pid); playerLeft(pid); break;
-    case 'vc': rxChunk(m, bin); break;
-    case 'need': resendClip(m, 'a'); break;
-    case 'verse': { const id = String(m.id || '').slice(0, 16); if(clips.has(id)) hostHandle(pid, m); else { net.pendingVerse.set(id, { pid, m }); askFor(id, pid); } break; }
-    default: hostHandle(pid, m);
-  }
+// join the room you are looking at
+async function joinHere(){
+  if(!S || myRoom || roomClosed) return;
+  const id = ident(roomCode) || { pid:rid(12), token:rid(32) };
+  let j; try{ j = await rpc('rr_join', { p_code:roomCode, p_pid:id.pid, p_token:id.token }); }catch(e){ return toast(netHelp(e), 7000); }
+  if(j === 'closed'){ roomClosed = true; render(); return toast('This room is closed for new players.'); }
+  if(j === 'full') return toast('This room is full.');
+  if(j !== 'ok') return toast('Could not join. Try again.');
+  saveIdent(roomCode, id); me.pid = id.pid; myRoom = true; rememberRoom(roomCode);
+  await mutate(d => { d.players[me.pid] = { name:me.name, av:me.av }; if(!d.order.includes(me.pid)) d.order.push(me.pid); if(d.phase === 'lobby') fixBattlers(d); });
 }
-function guestNet(m, bin){
-  if(S && m._f !== S.host){ if(m.t === 'lvl' && isTurn(m._f)) liveLevel = clamp(Number(m.v) || 0, 0, 1); return; }
-  if(m.t !== 'state' && !S) return;
-  net.lastHost = Date.now(); if(lost){ lost = false; render(); }
-  switch(m.t){
-    case 'state': {
-      const s = m.s; if(!s || typeof s !== 'object' || s.code !== roomCode || !s.players || !Array.isArray(s.order)) return;
-      if(S && s.v < S.v && S.v - s.v < 40) return;                       // an older copy that arrived late
-      S = s;
-      if(view === 'busy' || view === 'home'){ view = 'room'; keepAwake(); startTick(); try{ history.replaceState(null, '', '#' + S.code); }catch{} }
-      if(!S.players[me.pid]) sayHi();
-      afterState(); break;
+async function refresh(force){
+  if(!roomCode || !S || S.solo) return;
+  let r; try{ r = await rpc('rr_get', { p_code:roomCode, p_since:force ? 0 : ver }); }
+  catch(e){ if(!lost){ lost = true; render(); } return; }
+  if(lost){ lost = false; render(); }
+  if(!r){ leave(); return toast('This room no longer exists.', 6000); }
+  const wasClosed = roomClosed; roomClosed = !!r.closed; closesAt = r.closes_at ? new Date(r.closes_at) : closesAt;
+  if(r.state && r.version !== ver){ S = r.state; ver = r.version; if(!S.players[me.pid]) myRoom = false; afterState(); }
+  else if(wasClosed !== roomClosed) render();
+}
+// change the room: apply fn to a copy, save it, and redo it on top of the latest version if someone was faster
+let mutating = Promise.resolve();
+function mutate(fn){
+  const run = async () => {
+    if(!S) return false;
+    if(S.solo){ const d = structuredClone(S); if(fn(d) === false) return false; S = d; afterState(); return true; }
+    const id = ident(roomCode); if(!id || !myRoom){ toast('Join the room first.'); return false; }
+    for(let i = 0; i < 6; i++){
+      const d = structuredClone(S); if(fn(d) === false) return false;
+      let v; try{ v = await rpc('rr_put', { p_code:roomCode, p_pid:id.pid, p_token:id.token, p_version:ver, p_state:d }); }
+      catch(e){ toast(netHelp(e), 6000); return false; }
+      if(v > 0){ S = d; ver = v; afterState(); return true; }
+      if(v === -2){ await refresh(true); toast(roomClosed ? 'This room is closed. You can still listen to everything.' : 'Could not save that. Try again.'); return false; }
+      await refresh(true);
     }
-    case 'vc': rxChunk(m, bin); break;
-    case 'lvl': liveLevel = clamp(Number(m.v) || 0, 0, 1); break;
-    case 'who': if(m.to === me.pid) sayHi(); break;
-    case 'need': if(m.to === me.pid) resendClip(m, 'h'); break;
-    case 'closed': leave(true); toast('The host closed the room.', 6000); break;
-  }
+    toast('The room is busy. Try again.'); return false;
+  };
+  return mutating = mutating.then(run, run);
 }
-function netTick(){
-  if(!S || !net.key) return; const now = Date.now(); net.tickN++;
-  if(isHost){
-    if(net.tickN % 2 === 0) netSend('a', { t:'state', s:S });
-    for(const pid of [...S.order]) if(pid !== me.pid && S.players[pid] && S.players[pid].on && now - (net.lastSeen.get(pid) || 0) > 16000) playerLeft(pid);
-    return;
-  }
-  if(net.tickN % 2 === 0) netSend('h', { t:'ping' });
-  const quiet = now - net.lastHost;
-  if(quiet > 180000){ leave(true); return toast('The room has closed.', 6000); }
-  if((quiet > 13000) !== lost){ lost = quiet > 13000; render(); }
-  const v = curVerse();
-  if(v && !v.skipped && !clips.has(v.id)){ if(!net.missSince) net.missSince = now; else if(now - net.missSince > 2500) askFor(v.id); } else net.missSince = 0;
-  const o = net.outVerse;
-  if(o){ if(!(isTurn(me.pid) && S.turn.step === 'rec')) net.outVerse = null; else if(now - o.at > 5000){ o.at = now; netSend('h', { t:'verse', id:o.id, judge:o.judge, bars:o.bars }); } }
+let pollT = null;
+function startPolling(){
+  clearTimeout(pollT);
+  const loop = async () => { if(view !== 'room' || !S || S.solo) return; await refresh(false); pollT = setTimeout(loop, document.visibilityState === 'visible' ? 2000 : 8000); };
+  pollT = setTimeout(loop, 1500);
 }
-function leave(silent){
-  stopAudio(); abortRec(); stopBot();
-  if(S && net.key){ if(isHost) netSend('a', { t:'closed' }); else netSend('h', { t:'bye' }); }
-  netClose();
-  isHost = false; S = null; lost = false; clips.clear(); autoPlayed.clear(); heard.clear();
+// recordings: uploaded in parts, downloaded on demand
+async function uploadVerse(id, pcm){
+  const me_ = ident(roomCode), n = Math.ceil(pcm.length / PART);
+  for(let i = 0; i < n; i++){
+    const part = pcm.subarray(i * PART, (i + 1) * PART); let s = '';
+    for(let k = 0; k < part.length; k += 0x8000) s += String.fromCharCode.apply(null, part.subarray(k, k + 0x8000));
+    let ok = false;
+    for(let t = 0; t < 3 && !ok; t++){ try{ ok = await rpc('rr_add_part', { p_code:roomCode, p_pid:me_.pid, p_token:me_.token, p_id:id, p_part:i, p_parts:n, p_data:btoa(s) }); }catch{ await sleep(1500); } }
+    if(!ok) return false;
+  }
+  return true;
+}
+const fetching = new Set();
+async function fetchVerse(id){
+  if(clips.has(id) || fetching.has(id) || !roomCode) return;
+  fetching.add(id);
+  try{
+    const parts = await rpc('rr_verse', { p_code:roomCode, p_id:id });
+    if(Array.isArray(parts)){
+      const bins = parts.map(b => Uint8Array.from(atob(b), c => c.charCodeAt(0))), pcm = new Uint8Array(bins.reduce((a, b) => a + b.length, 0));
+      let o = 0; for(const b of bins){ pcm.set(b, o); o += b.length; }
+      clips.set(id, makeClip(pcm)); maybeAutoPlay(); render();
+    }
+  }catch{}
+  fetching.delete(id);
+}
+function leave(){
+  stopAudio(); abortRec(); stopBot(); clearTimeout(pollT);
+  S = null; roomCode = ''; myRoom = false; lost = false; sending = null; clips.clear(); autoPlayed.clear(); heard.clear();
   try{ wake && wake.release(); }catch{} wake = null;
   try{ history.replaceState(null, '', location.pathname + location.search); }catch{}
-  view = 'home'; render();
+  view = 'home'; render(); loadRecent();
 }
 async function keepAwake(){ try{ if(navigator.wakeLock && !wake){ wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => wake = null); } }catch{} }
-document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState !== 'visible' || !S) return;
-  keepAwake(); for(const l of net.links) l.wake();
-  if(isHost) netSend('a', { t:'state', s:S }); else netSend('h', { t:'ping' });
-});
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible' && S && !S.solo){ keepAwake(); refresh(false); } });
 
-/* ---------- game rules (run on the host device) -------------------- */
-const performer = () => S && S.turn ? (S.turn.i % 2 === 0 ? S.set.a : S.set.b) : null;
-const isTurn = pid => S && S.phase === 'battle' && performer() === pid;
-const curVerse = () => S && S.phase === 'battle' && S.turn.step === 'listen' ? S.verses[S.verses.length - 1] : null;
+// your rooms on the home screen, with whose turn it is
+let recentInfo = {};
+async function loadRecent(){
+  recent = store.get('rr.rooms', []);
+  if(!API || !recent.length){ if(view === 'home') render(); return; }
+  await Promise.all(recent.map(async c => { try{ const r = await rpc('rr_get', { p_code:c, p_since:0 }); if(r && r.state) recentInfo[c] = r; else { delete recentInfo[c]; forgetRoom(c); } }catch{} }));
+  if(view === 'home') render();
+}
+function roomStatus(c){
+  const r = recentInfo[c], id = ident(c); if(!r) return { text:'…', mine:false };
+  const s = r.state, pid = id && id.pid;
+  if(s.phase === 'results') return { text:'Finished', mine:false };
+  if(s.phase === 'lobby') return { text:r.closed ? 'Closed' : 'In the lobby', mine:false };
+  if(r.closed) return { text:'Closed', mine:false };
+  const who = performerOf(s); return who === pid ? { text:'Your turn!', mine:true } : { text:'Waiting for ' + ((s.players[who] || {}).name || 'a rapper'), mine:false };
+}
+
+/* ---------- game rules (any player can apply them) ----------------- */
+const performerOf = s => s && s.phase === 'battle' ? (s.verses.length % 2 === 0 ? s.set.a : s.set.b) : null;
+const performer = () => performerOf(S);
+const isTurn = pid => !!S && S.phase === 'battle' && !roomClosed && performer() === pid;
+const lastVerse = () => S && S.verses.length ? S.verses[S.verses.length - 1] : null;
 const c10 = v => clamp(Math.round(Number(v) || 0), 0, 10);
-function fixBattlers(){
-  const ok = p => p && S.players[p]; const set = S.set;
+const recLive = () => S && S.rec && S.rec.pid === performer() && Date.now() - S.rec.at < 180000;
+function fixBattlers(d){
+  const ok = p => p && d.players[p], set = d.set;
   if(!ok(set.a)) set.a = null; if(!ok(set.b) || set.b === set.a) set.b = null;
-  for(const p of S.order){ if(!set.a && p !== set.b) set.a = p; else if(!set.b && p !== set.a) set.b = p; }
+  for(const p of d.order){ if(!set.a && p !== set.b) set.a = p; else if(!set.b && p !== set.a) set.b = p; }
 }
-function playerLeft(pid){
-  if(!S || !S.players[pid]) return;
-  if(S.phase === 'lobby'){ delete S.players[pid]; S.order = S.order.filter(p => p !== pid); fixBattlers(); }
-  else S.players[pid].on = false;
-  push();
-}
-function hostHandle(pid, m){
-  if(!S) return;
-  switch(m.t){
-    case 'hi': case 'me':
-      S.players[pid] = { name:cleanName(m.name), av:cleanAv(m.av), on:true };
-      if(!S.order.includes(pid)) S.order.push(pid);
-      if(S.phase === 'lobby') fixBattlers();
-      push(); break;
-    case 'go': if(isTurn(pid) && S.turn.step === 'ready'){ S.turn.step = 'rec'; push(); } break;
-    case 'cancel': if(isTurn(pid) && S.turn.step === 'rec'){ S.turn.step = 'ready'; push(); } break;
-    case 'lvl': if(isTurn(pid) && pid !== me.pid) liveLevel = clamp(Number(m.v) || 0, 0, 1); break;
-    case 'verse': {
-      if(!isTurn(pid) || S.turn.step !== 'rec') break;
-      const id = String(m.id || '').slice(0, 16), c = clips.get(id), j = m.judge || {};
-      if(!c || c.pcm.length > RATE * 75) break;
-      S.verses.push({ id, by:pid, round:Math.floor(S.turn.i / 2) + 1, beat:S.set.beat, bars:clamp(Math.round(Number(m.bars)) || 1, 1, 16),
-        dur:c.pcm.length / RATE, judge:{ flow:c10(j.flow), energy:c10(j.energy), stamina:c10(j.stamina) }, ratings:{} });
-      S.turn.step = 'listen';
-      sendClip('a', id, c.pcm);
-      push(); break;
-    }
-    case 'rate': {
-      const v = S.verses.find(x => x.id === m.id), n = Math.round(Number(m.n));
-      if(v && !v.skipped && canRate(pid, v) && n >= 1 && n <= 5){ v.ratings[pid] = n; push(); }
-      break;
-    }
-  }
-}
-function crowdOf(v){ if(S.solo) return []; const battlers = [S.set.a, S.set.b]; const fans = S.order.filter(p => S.players[p] && S.players[p].on && !battlers.includes(p)); return fans.length ? fans : battlers.filter(p => p !== v.by); }
-function canRate(pid, v){ return pid !== v.by && crowdOf(v).includes(pid); }
+function crowdOf(v){ if(S.solo) return []; const battlers = [S.set.a, S.set.b]; const fans = S.order.filter(p => S.players[p] && !battlers.includes(p)); return fans.length ? fans : battlers.filter(p => p !== v.by); }
+function canRate(pid, v){ return myRoom && !roomClosed && pid !== v.by && !v.robot && crowdOf(v).includes(pid); }
 function verseScore(v){
   if(v.skipped) return { judge:0, crowd:0, total:0, avg:0, n:0 };
-  const judge = v.judge.flow + v.judge.energy + v.judge.stamina, r = Object.values(v.ratings);
+  const judge = v.judge.flow + v.judge.energy + v.judge.stamina, r = Object.values(v.ratings || {});
   const avg = r.length ? r.reduce((a, b) => a + b, 0) / r.length : 0, crowd = Math.round(avg * 4);
   return { judge, crowd, total:judge + crowd, avg, n:r.length };
 }
-function totals(hideCurrent){
-  const t = { [S.set.a]:0, [S.set.b]:0 }, cur = hideCurrent ? curVerse() : null;
-  for(const v of S.verses) if(v !== cur) t[v.by] = (t[v.by] || 0) + verseScore(v).total;
-  return t;
-}
-const host = {
-  set(k, v){ if(S.phase !== 'lobby') return; S.set[k] = v; push(); },
-  pick(pid){ if(S.phase !== 'lobby' || !S.players[pid]) return; const s = S.set;
-    if(s.a === pid) s.a = null; else if(s.b === pid) s.b = null; else if(!s.a) s.a = pid; else if(!s.b) s.b = pid; else { s.a = s.b; s.b = pid; }
-    push(); },
-  start(){ const s = S.set; if(!s.a || !s.b) return toast('Pick two rappers for the battle first.');
-    S.phase = 'battle'; S.verses = []; S.turn = { i:0, step:'ready' }; autoPlayed.clear(); heard.clear(); push(); },
-  next(){ if(S.phase !== 'battle') return; S.turn.i++; if(S.turn.i >= S.set.rounds * 2){ S.phase = 'results'; S.turn = null; } else S.turn.step = 'ready'; push(); },
-  end(){ if(S.phase === 'lobby') return; S.phase = 'lobby'; S.turn = null; S.verses = [];
-    for(const p of [...S.order]) if(!S.players[p].on){ delete S.players[p]; S.order = S.order.filter(x => x !== p); }
-    fixBattlers(); push(); },
-  rematch(){ [S.set.a, S.set.b] = [S.set.b, S.set.a]; host.start(); }
+function totals(){ const t = { [S.set.a]:0, [S.set.b]:0 }; for(const v of S.verses) t[v.by] = (t[v.by] || 0) + verseScore(v).total; return t; }
+const canSteer = () => myRoom && (S.solo || me.pid === S.host || me.pid === S.set.a || me.pid === S.set.b);
+const rules = {
+  set(k, v){ mutate(d => { if(d.phase !== 'lobby') return false; d.set[k] = v; }); },
+  pick(pid){ mutate(d => { if(d.phase !== 'lobby' || !d.players[pid]) return false; const s = d.set;
+    if(s.a === pid) s.a = null; else if(s.b === pid) s.b = null; else if(!s.a) s.a = pid; else if(!s.b) s.b = pid; else { s.a = s.b; s.b = pid; } }); },
+  start(){ if(!S.set.a || !S.set.b) return toast('Pick two rappers for the battle first.');
+    autoPlayed.clear(); heard.clear();
+    mutate(d => { if(!d.set.a || !d.set.b) return false; d.phase = 'battle'; d.verses = []; d.rec = null; d.started = Date.now(); }); },
+  addVerse(v){ return mutate(d => { if(d.phase !== 'battle' || performerOf(d) !== v.by || d.verses.some(x => x.id === v.id)) return false;
+    d.verses.push(v); d.rec = null; if(d.verses.length >= d.set.rounds * 2) d.phase = 'results'; }); },
+  end(){ mutate(d => { if(d.phase === 'lobby') return false; d.phase = 'lobby'; d.verses = []; d.rec = null; fixBattlers(d); }); },
+  rematch(){ autoPlayed.clear(); heard.clear(); mutate(d => { [d.set.a, d.set.b] = [d.set.b, d.set.a]; d.phase = 'battle'; d.verses = []; d.rec = null; d.started = Date.now(); }); },
+  rate(id, n){ mutate(d => { const v = d.verses.find(x => x.id === id); if(!v || v.skipped || v.robot || v.by === me.pid || n < 1 || n > 5) return false; v.ratings = v.ratings || {}; v.ratings[me.pid] = n; }); },
+  leaveLobby(){ return mutate(d => { if(d.phase !== 'lobby' || !d.players[me.pid]) return false; delete d.players[me.pid]; d.order = d.order.filter(p => p !== me.pid); if(d.host === me.pid) d.host = d.order[0] || null; fixBattlers(d); }); }
 };
 
 /* ---------- solo mode: battle a robot rapper -------------------------
@@ -885,15 +801,16 @@ function pickLines(bars){
   return out;
 }
 function startSolo(){
-  audio(); ttsUnlock(); stopAudio(); netClose(); store.set('rr.solo', solo);
-  const R = ROBOTS[solo.level]; isHost = true; roomCode = ''; soloUsed = [];
+  audio(); ttsUnlock(); stopAudio(); clearTimeout(pollT); store.set('rr.solo', solo);
+  const R = ROBOTS[solo.level]; roomCode = ''; soloUsed = []; myRoom = true; roomClosed = false; ver = 0;
+  clips.clear(); autoPlayed.clear(); heard.clear();
   S = newState('SOLO'); S.solo = { level:solo.level, lang:solo.lang };
-  S.players[me.pid] = { name:me.name, av:me.av, on:true }; S.players.robot = { name:R.name, av:{ robot:solo.level }, on:true }; S.order = [me.pid, 'robot'];
+  S.players[me.pid] = { name:me.name, av:me.av }; S.players.robot = { name:R.name, av:{ robot:solo.level } }; S.order = [me.pid, 'robot'];
   Object.assign(S.set, { beat:solo.beat, bars:solo.bars, rounds:solo.rounds, a:me.pid, b:'robot', topic:'You vs. ' + R.name });
-  view = 'room'; keepAwake(); host.start(); scrollTo(0, 0);
+  S.phase = 'battle'; view = 'room'; keepAwake(); afterState(); scrollTo(0, 0);
 }
 function robotGo(){
-  if(bot || !S || !S.solo || performer() !== 'robot' || S.phase !== 'battle' || S.turn.step !== 'ready') return;
+  if(bot || !S || !S.solo || performer() !== 'robot') return;
   ttsUnlock(); stopAudio();
   const ac = audio(), set = S.set, so = S.solo, R = ROBOTS[so.level], lines = pickLines(set.bars);
   const out = ac.createGain(); out.gain.value = .5; out.connect(MASTER);
@@ -904,22 +821,21 @@ function robotGo(){
     if(bot !== b || !voiced) return;
     try{
       const u = new SpeechSynthesisUtterance(line.replace(/[,.:;!?]/g, ' ')); if(voice) u.voice = voice; u.lang = voice ? voice.lang : 'en-US';
-      u.rate = clamp(syllables(line) / (sch.bar * 3.8), 1, 1.8);          // fast enough that each line fits its bar u.pitch = R.pitch; u.volume = 1;
+      u.rate = clamp(syllables(line) / (sch.bar * 3.8), 1, 1.8); u.pitch = R.pitch; u.volume = 1;   // fast enough that each line fits its bar
       u.onstart = () => { if(bot === b) b.talking = true; }; u.onend = u.onerror = () => { if(bot === b) b.talking = false; };
       speechSynthesis.speak(u);
     }catch{}
   }, Math.max(0, (sch.verseStart + k * sch.bar - ac.currentTime) * 1000 - 60))));
   b.timers.push(setTimeout(robotDone, (sch.end - ac.currentTime) * 1000 + 500));
-  S.turn.step = 'rec'; push();
+  render();
 }
 function robotDone(){
   const b = bot; if(!b || !S) return;
   if(b.voiced && b.waits < 8){ let busy = false; try{ busy = speechSynthesis.speaking || speechSynthesis.pending; }catch{} if(busy){ b.waits++; b.timers.push(setTimeout(robotDone, 400)); return; } }
   const r = ROBOTS[S.solo.level].range, pt = () => r[0] + rnd(r[1] - r[0] + 1), id = 'bot' + rid(6);
-  stopBot();
-  S.verses.push({ id, by:'robot', robot:true, lines:b.lines, round:Math.floor(S.turn.i / 2) + 1, beat:S.set.beat, bars:S.set.bars, dur:0,
+  stopBot(); heard.add(id); autoPlayed.add(id);
+  rules.addVerse({ id, by:'robot', robot:true, lines:b.lines, round:Math.floor(S.verses.length / 2) + 1, beat:S.set.beat, bars:S.set.bars, dur:0,
     judge:{ flow:pt(), energy:pt(), stamina:pt() }, ratings:{} });
-  heard.add(id); S.turn.step = 'listen'; push();
 }
 function stopBot(){
   const b = bot; if(!b) return; bot = null;
@@ -978,27 +894,29 @@ async function downloadBattle(){
 
 /* ---------- recording a verse -------------------------------------- */
 async function startVerse(){
-  if(rec || !isTurn(me.pid) || S.turn.step !== 'ready') return;
+  if(rec || sending || !isTurn(me.pid)) return;
   stopAudio();
   const ac = audio(); let mic;
   try{ mic = await openMic(); }catch(e){ return toast(micHelp(e), 7000); }
-  if(!isTurn(me.pid) || S.turn.step !== 'ready'){ mic.close(); return; }
+  if(!isTurn(me.pid)){ mic.close(); return; }
   const out = ac.createGain(); out.gain.value = .8; out.connect(MASTER);
   const sch = scheduleBeat(ac, out, S.set.beat, ac.currentTime + .45, S.set.bars, true);
   const lat = clamp((ac.outputLatency || 0) + (ac.baseLatency || 0) + mic.inLat, 0, .35);
   mic.chunks = [];
-  rec = { mic, out, sch, lat, beat:S.set.beat, bars:S.set.bars, done:false, lastLvl:0 };
+  rec = { mic, out, sch, lat, beat:S.set.beat, bars:S.set.bars, done:false };
   rec.timer = setTimeout(() => finishVerse(), (sch.end + lat - ac.currentTime) * 1000 + 180);
-  send({ t:'go' }); render();
+  if(!S.solo) mutate(d => { if(performerOf(d) !== me.pid) return false; d.rec = { pid:me.pid, at:Date.now() }; });   // others see "is rapping now"
+  render();
 }
 function abortRec(){ if(!rec) return; clearTimeout(rec.timer); try{ rec.out.disconnect(); }catch{} rec.mic.close(); rec = null; }
+function clearRecFlag(){ if(S && !S.solo && S.rec && S.rec.pid === me.pid) mutate(d => { if(!d.rec || d.rec.pid !== me.pid) return false; d.rec = null; }); }
 function finishVerse(){
   const r = rec; if(!r || r.done) return; r.done = true; clearTimeout(r.timer);
   const ac = audio(), sr = ac.sampleRate, endT = Math.min(ac.currentTime, r.sch.end + r.lat);
   try{ r.out.disconnect(); }catch{}
   const chunks = r.mic.chunks; r.mic.chunks = null; r.mic.close();
   const f0 = Math.round((r.sch.verseStart + r.lat) * sr), n = Math.max(0, Math.round(endT * sr) - f0);
-  if(n < sr * 1.5){ rec = null; send({ t:'cancel' }); toast('That was too short to count. Try again!'); render(); return; }
+  if(n < sr * 1.5){ rec = null; clearRecFlag(); toast('That was too short to count. Try again!'); render(); return; }
   render();
   setTimeout(() => {
     const x = new Float32Array(n);
@@ -1009,13 +927,26 @@ function finishVerse(){
     let pk = 0; for(let i = 0; i < y.length; i++){ const a = Math.abs(y[i]); if(a > pk) pk = a; }
     if(pk > .02){ const g = Math.min(8, .92 / pk); for(let i = 0; i < y.length; i++) y[i] *= g; }
     const pcm = muEncode(y), id = rid(8);
-    clips.set(id, makeClip(pcm));
+    clips.set(id, makeClip(pcm)); heard.add(id); autoPlayed.add(id);
     const bars = clamp(Math.ceil((y.length / RATE) / r.sch.bar - .02), 1, r.bars);
     rec = null;
-    if(isHost) hostHandle(me.pid, { t:'verse', id, judge, bars });
-    else { sendClip('h', id, pcm); net.outVerse = { id, judge, bars, at:Date.now() }; netSend('h', { t:'verse', id, judge, bars }); }
+    const entry = { id, by:me.pid, round:Math.floor(S.verses.length / 2) + 1, beat:r.beat, bars, dur:pcm.length / RATE,
+      judge:{ flow:c10(judge.flow), energy:c10(judge.energy), stamina:c10(judge.stamina) }, ratings:{} };
+    if(S.solo) rules.addVerse(entry); else { sending = { entry, pcm, state:'up' }; sendVerse(); }
     render();
   }, 30);
+}
+async function sendVerse(){
+  const s = sending; if(!s) return;
+  s.state = 'up'; render();
+  const ok = await uploadVerse(s.entry.id, s.pcm);
+  if(sending !== s) return;
+  if(!ok){ s.state = 'fail'; render(); return; }
+  const saved = await rules.addVerse(s.entry);
+  if(sending !== s) return;
+  if(saved || (S && S.verses.some(v => v.id === s.entry.id))){ sending = null; render(); }
+  else if(!isTurn(me.pid)){ sending = null; toast('The battle moved on, so your verse was not added.', 6000); render(); }
+  else { s.state = 'fail'; render(); }
 }
 
 /* ---------- playback ----------------------------------------------- */
@@ -1035,8 +966,10 @@ function playVerse(v){
   render();
 }
 function maybeAutoPlay(){
-  const v = curVerse();
-  if(v && !autoPlayed.has(v.id) && clips.has(v.id)){ autoPlayed.add(v.id); playVerse(v); }
+  const v = lastVerse();
+  if(!v || v.robot || S.phase !== 'battle' || autoPlayed.has(v.id) || !clips.has(v.id) || rec || bot) return;
+  if(!AC || AC.state !== 'running' || document.visibilityState !== 'visible') return;     // browsers only play sound after a tap
+  autoPlayed.add(v.id); playVerse(v);
 }
 let preview = null;
 function previewBeat(id){
@@ -1050,11 +983,15 @@ async function micCheck(){
 }
 function afterState(){
   if(S){
-    const v = curVerse();
-    if(playing && (!v || v.id !== playing.id) && S.phase !== 'results') stopAudio();
-    if(rec && !(isTurn(me.pid) && S.turn.step !== 'listen')) abortRec();
+    if(playing && !S.verses.some(v => v.id === playing.id)) stopAudio();
+    if(rec && !isTurn(me.pid)) abortRec();
+    if(sending && !isTurn(me.pid) && !S.verses.some(v => v.id === sending.entry.id)) sending = null;
     if(S.phase !== 'lobby' && micTest){ micTest.close(); micTest = null; }
-    if(bot && !(S.phase === 'battle' && performer() === 'robot' && S.turn.step === 'rec')) stopBot();
+    if(bot && performer() !== 'robot') stopBot();
+    if(!S.solo){
+      if(S.phase === 'battle'){ const v = lastVerse(); if(v && !v.robot) fetchVerse(v.id); }
+      else if(S.phase === 'results') for(const v of S.verses) if(!v.robot && !v.skipped) fetchVerse(v.id);
+    }
     maybeAutoPlay();
   }
   render();
@@ -1089,7 +1026,6 @@ function tick(){
         const bt = $('#recbar'); if(bt) bt.textContent = 'Bar ' + bar + ' of ' + r.bars;
         const pr = $('#recprog'); if(pr) pr.style.width = clamp(pos / r.bars * 100, 0, 100) + '%';
         document.querySelectorAll('#recdots b').forEach((d, i) => d.classList.toggle('hit', i === beat));
-        if(t - r.lastLvl > .25){ r.lastLvl = t; const v = Math.round(lvl * 100) / 100; netSend('a', { t:'lvl', v }, null, 'light'); if(!isHost) netSend('h', { t:'lvl', v }, null, 'light'); }
       }
     }
   } else if(playing && ac){
@@ -1097,31 +1033,35 @@ function tick(){
     lvl = pos >= 0 && i < p.env.length ? clamp(p.env[i] * 5, 0, 1) : 0;
     const pr = $('#playprog'); if(pr) pr.style.width = clamp(pos / p.dur * 100, 0, 100) + '%';
   } else if(micTest){ lvl = clamp(micTest.level * 6, 0, 1); }
-  else if(S.phase === 'battle' && S.turn.step === 'rec'){ lvl = liveLevel; liveLevel *= .93; }
+  else if(S.phase === 'battle' && recLive()){ lvl = .2 + .35 * Math.abs(Math.sin(performance.now() / 140)); }
   document.documentElement.style.setProperty('--lvl', lvl.toFixed(3));
 }
 requestAnimationFrame(tick);
 
 /* ---------- screens ------------------------------------------------ */
+const fmtDay = d => d ? d.toLocaleDateString(undefined, { weekday:'short', day:'numeric', month:'short' }) : '';
 function render(){
   const app = $('#app'); let h = '';
   if(view === 'home') h = homeView();
   else if(view === 'creator') h = creatorView();
   else if(view === 'solo') h = soloView();
-  else if(view === 'busy') h = `<div class="busy"><div class="spin"></div><h2>${esc(busyText)}</h2><div><button class="btn mini" data-act="leave">Cancel</button></div></div>`;
+  else if(view === 'busy') h = `<div class="busy"><div class="spin"></div><h2>${esc(busyText)}</h2><div><button class="btn mini" data-act="home">Cancel</button></div></div>`;
   else if(view === 'room' && S) h = S.phase === 'lobby' ? lobbyView() : S.phase === 'battle' ? battleView() : resultsView();
   document.body.classList.toggle('stage', view === 'room' && !!S && S.phase !== 'lobby');
-  if(lost && view === 'room') h = `<div class="lost" role="alert">Lost the connection to the host. Trying to get back in…</div>` + h;
+  if(lost && view === 'room') h = `<div class="lost" role="alert">No connection to the game server. Trying again… Your room is safe.</div>` + h;
   app.innerHTML = h;
 }
 const logo = () => `<h1 class="logo"><span>Rhyme</span><span>Rumble</span></h1>`;
 function homeView(){
+  const rooms = recent.filter(c => recentInfo[c]);
   return `${logo()}
   <p class="tag">Design your rapper. Grab the mic. Battle your friends.</p>
   <section class="card">
     <div class="me">${avHTML(me.av)}<div class="grow"><span class="lab">Your rapper</span><div class="name">${esc(me.name)}</div></div></div>
     <button class="btn teal" data-act="creator">Change my look</button>
   </section>
+  ${rooms.length ? `<section class="card"><h2>Your rooms</h2><div class="rooms">${rooms.map(c => { const st = roomStatus(c), s = recentInfo[c].state, op = s.order.filter(p => p !== (ident(c) || {}).pid).map(p => (s.players[p] || {}).name).filter(Boolean);
+      return `<button class="roomrow${st.mine ? ' hot' : ''}" data-act="room" data-code="${c}"><span class="rc">${c}</span><span class="rs"><b>${esc(st.text)}</b><span>${op.length ? 'with ' + esc(op.slice(0, 3).join(', ')) + (op.length > 3 ? ' +' + (op.length - 3) : '') : 'nobody else yet'}</span></span></button>`; }).join('')}</div></section>` : ''}
   <section class="card">
     <button class="btn pink big" data-act="create">Start a battle room</button>
     <button class="btn teal big" data-act="solo">Battle the robot</button>
@@ -1135,7 +1075,7 @@ function homeView(){
     <ol class="steps">
       <li><span>One player starts a room and shares the 6-letter code or the invite link.</span></li>
       <li><span>Pick two rappers, a beat and a topic. Everyone else is the crowd.</span></li>
-      <li><span>Take turns rapping over the beat. Your microphone is only on during your own verse.</span></li>
+      <li><span>Take turns rapping over the beat, live together or whenever you have time. The room stays open for 7 days.</span></li>
       <li><span>Boombot the robot judge scores your rhythm, energy and stamina. The crowd hands out microphones for the rhymes.</span></li>
     </ol>
     <p class="small">House rule: roast the topic, not the person.</p>
@@ -1160,21 +1100,25 @@ function creatorView(){
 function tile(pid, pickable){
   const p = S.players[pid], s = S.set, b = [];
   if(s.a === pid) b.push('<span class="badge b1">Battler 1</span>'); if(s.b === pid) b.push('<span class="badge b2">Battler 2</span>');
-  if(pid === S.host) b.push('<span class="badge">Host</span>'); if(pid === me.pid) b.push('<span class="badge you">You</span>');
+  if(pid === S.host) b.push('<span class="badge">Host</span>'); if(myRoom && pid === me.pid) b.push('<span class="badge you">You</span>');
   const inner = `${avHTML(p.av)}<span class="nm">${esc(p.name)}</span><span class="badges">${b.join('')}</span>`;
-  const cls = `tile${s.a === pid || s.b === pid ? ' pick' : ''}${p.on ? '' : ' off'}`;
+  const cls = `tile${s.a === pid || s.b === pid ? ' pick' : ''}`;
   return pickable ? `<button class="${cls}" data-act="pick" data-pid="${esc(pid)}">${inner}</button>` : `<div class="${cls}">${inner}</div>`;
 }
+const closedNote = () => `<p class="small center">This room closed on ${fmtDay(closesAt)}. You can still look and listen.</p>`;
 function lobbyView(){
-  const s = S.set, hostName = S.players[S.host] ? S.players[S.host].name : 'the host';
-  const chips = (k, list) => list.map(([val, label]) => `<button class="chip" aria-pressed="${s[k] === val}" ${isHost ? `data-act="set" data-k="${k}" data-v="${val}"` : 'disabled'}>${label}</button>`).join('');
+  const s = S.set, can = myRoom && !roomClosed;
+  const chips = (k, list) => list.map(([val, label]) => `<button class="chip" aria-pressed="${s[k] === val}" ${can ? `data-act="set" data-k="${k}" data-v="${val}"` : 'disabled'}>${label}</button>`).join('');
   const ready = s.a && s.b;
   return `
   <section class="card codebox"><span class="lab">Room code</span><div class="codebig">${esc(S.code)}</div>
-    <div class="row" style="justify-content:center"><button class="btn sun mini" data-act="invite">Copy invite link</button></div></section>
+    <div class="row" style="justify-content:center"><button class="btn sun mini" data-act="invite">Copy invite link</button></div>
+    <span class="small" style="color:#E4DBFF">Open until ${fmtDay(closesAt)}. Friends can join any time before then.</span></section>
+  ${!myRoom && !roomClosed ? `<button class="btn pink big" data-act="join">Join this room as ${esc(me.name)}</button>` : ''}
+  ${roomClosed ? closedNote() : ''}
   <section class="card"><h2>The crew (${S.order.length})</h2>
-    <div class="crew">${S.order.map(p => tile(p, isHost)).join('')}</div>
-    <p class="small">${isHost ? (S.order.length < 2 ? 'Waiting for players. Share the code above.' : 'Tap two rappers to put them in the battle. Everyone else is the crowd.') : 'The host picks who battles.'}</p>
+    <div class="crew">${S.order.map(p => tile(p, can)).join('')}</div>
+    <p class="small">${!can ? 'Join to pick who battles.' : S.order.length < 2 ? 'Waiting for players. Share the code above.' : 'Tap two rappers to put them in the battle. Everyone else is the crowd.'}</p>
     <div class="row"><button class="btn teal mini" data-act="creator">Change my look</button><button class="btn mini" data-act="miccheck" ${micTest ? 'disabled' : ''}>${micTest ? 'Say something…' : 'Mic check'}</button>
       ${micTest ? '<span class="meter grow" style="min-width:90px"><i></i></span>' : ''}</div>
   </section>
@@ -1185,11 +1129,10 @@ function lobbyView(){
       <span class="small">${s.bars} bars of ${BEATS[s.beat].name} is about ${Math.round(s.bars * 240 / BEATS[s.beat].bpm)} seconds.</span></div>
     <div class="group"><span class="lab">Rounds</span><div class="opts">${chips('rounds', [[1, '1'], [2, '2'], [3, '3']])}</div></div>
     <div class="group"><span class="lab">Topic</span><div class="topic">${esc(s.topic)}</div>
-      ${isHost ? '<div><button class="btn mini sun" data-act="spin">Spin a new topic</button></div>' : ''}</div>
+      ${can ? '<div><button class="btn mini sun" data-act="spin">Spin a new topic</button></div>' : ''}</div>
   </section>
-  ${isHost ? `<button class="btn pink big" data-act="start" ${ready ? '' : 'disabled'}>${ready ? 'Start the battle' : 'Need two rappers'}</button>`
-           : `<p class="center" style="font-weight:700">Waiting for ${esc(hostName)} to start the battle…</p>`}
-  <div class="center"><button class="btn mini" data-act="leave">Leave room</button></div>`;
+  ${can ? `<button class="btn pink big" data-act="start" ${ready ? '' : 'disabled'}>${ready ? 'Start the battle' : 'Need two rappers'}</button>` : ''}
+  <div class="row" style="justify-content:center"><button class="btn mini" data-act="home">Back to home</button>${myRoom && !roomClosed ? '<button class="btn mini" data-act="leave">Leave this room</button>' : ''}</div>`;
 }
 function fighter(pid, on, pts){
   const p = S.players[pid] || { name:'Gone', av:{} };
@@ -1200,25 +1143,32 @@ function judgeCard(v){
   const stat = (label, n) => `<div class="stat"><span>${label}</span><span class="bar"><i style="width:${n * 10}%"></i></span><span class="n">${n}</span></div>`;
   return `<div class="judge"><div class="who"><span class="bot">${BOT_SVG}</span><div class="grow"><span class="lab">Boombot says</span><div style="font-weight:700">${esc(judgeSays(j))}</div></div></div>
     ${stat('Flow', j.flow)}${stat('Energy', j.energy)}${stat('Stamina', j.stamina)}
-    <div class="sum"><span class="pill">Boombot ${sc.judge}/30</span>${S.solo ? '' : `<span class="pill">Crowd ${sc.n ? sc.avg.toFixed(1) + ' mics = ' + sc.crowd : '…'}/20</span>`}<span class="pill tot">${sc.total} points</span></div></div>`;
+    <div class="sum"><span class="pill">Boombot ${sc.judge}/30</span>${S.solo || v.robot ? '' : `<span class="pill">Crowd ${sc.n ? sc.avg.toFixed(1) + ' mics = ' + sc.crowd : '…'}/20</span>`}<span class="pill tot">${sc.total} points</span></div></div>`;
 }
 function micsRow(v){
-  const mine = v.ratings[me.pid] || 0;
-  return `<div class="group" style="justify-items:center"><span class="lab" style="color:#CFC4F2">How many mics for those rhymes?</span><div class="mics">${
+  const mine = (v.ratings || {})[me.pid] || 0;
+  return `<div class="group" style="justify-items:center"><span class="lab mlab">How many mics for those rhymes?</span><div class="mics">${
     [1, 2, 3, 4, 5].map(n => `<button class="mic${n <= mine ? ' lit' : ''}" aria-label="${n} microphone${n > 1 ? 's' : ''}" aria-pressed="${n === mine}" data-act="rate" data-n="${n}" data-id="${esc(v.id)}">${MIC_ICON}</button>`).join('')}</div></div>`;
 }
+function versePanel(v){
+  const P = S.players[v.by] || { name:'?' };
+  if(v.robot) return `<section class="panel"><h2>Latest verse: ${esc(P.name)}</h2><div class="lyrics">${v.lines.map(esc).join('<br>')}</div>${judgeCard(v)}</section>`;
+  const has = clips.has(v.id), now = playing && playing.id === v.id, done = heard.has(v.id) || v.by === me.pid;
+  const crowd = crowdOf(v), got = crowd.filter(p => (v.ratings || {})[p]).length;
+  return `<section class="panel"><h2>${now ? 'Now playing' : 'Latest verse'}: ${esc(P.name)}</h2>
+    ${has ? `<div class="track"><i id="playprog" style="${now ? '' : done ? 'width:100%' : ''}"></i></div>
+             <div class="row" style="justify-content:center"><button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${now ? 'Start over' : done ? 'Play it again' : 'Play the verse'}</button></div>`
+          : `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><p class="small">Getting the verse…</p>`}
+    ${S.solo ? '' : canRate(me.pid, v) ? micsRow(v) : ''}
+    ${done ? judgeCard(v) : `<p class="small">Listen to it to see what Boombot thinks.</p>`}
+    ${S.solo ? '' : `<p class="small">${got} of ${crowd.length} crowd rating${crowd.length === 1 ? '' : 's'} in</p>`}</section>`;
+}
 function battleView(){
-  const s = S.set, t = S.turn, cur = performer(), mine = cur === me.pid, P = S.players[cur] || { name:'?' }, tot = totals(true);
-  const round = Math.floor(t.i / 2) + 1, hostName = S.players[S.host] ? S.players[S.host].name : 'the host';
+  const s = S.set, cur = performer(), mine = isTurn(me.pid) && myRoom, P = S.players[cur] || { name:'?' }, tot = totals();
+  const round = Math.min(Math.floor(S.verses.length / 2) + 1, s.rounds), last = lastVerse();
   let panel = '';
-  if(t.step === 'ready'){
-    panel = mine
-      ? `<h2>Your turn, ${esc(P.name)}!</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. You get a 4-beat count-in, then go.</p>
-         <button class="btn pink big" data-act="drop">Drop the beat</button><p class="small">Headphones sound best. The mic switches off when your verse ends.</p>`
-      : cur === 'robot' ? `<h2>${esc(P.name)} is up next</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. Listen and read along.</p><button class="btn pink big" data-act="robotgo">Bring it on</button>`
-      : `<h2>${esc(P.name)} is warming up…</h2><p class="small">${s.bars} bars of ${BEATS[s.beat].name} coming up.</p>${P.on === false ? '<p>They seem to have lost their connection.</p>' : ''}`;
-  } else if(t.step === 'rec'){
-    if(mine && rec && !rec.done) panel = `<div id="recbox" style="display:grid;gap:14px;justify-items:center;width:100%">
+  if(roomClosed) panel = `<h2>This room has closed</h2><p>It closed on ${fmtDay(closesAt)} before the battle finished. You can still listen to every verse.</p>`;
+  else if(mine && rec && !rec.done) panel = `<div id="recbox" style="display:grid;gap:14px;justify-items:center;width:100%">
         <span class="onair">Mic is on</span>
         <div id="reccount" class="count">4</div>
         <div id="recbars" style="display:grid;gap:12px;width:100%;justify-items:center" hidden>
@@ -1226,59 +1176,100 @@ function battleView(){
           <div class="track"><i id="recprog"></i></div></div>
         <div class="meter"><i></i></div>
         <button class="btn mini" data-act="done">I'm done</button></div>`;
-    else if(mine && rec) panel = `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><h2>Sending your verse…</h2>`;
-    else if(mine) panel = `<h2>Sending your verse…</h2><p class="small">Taking too long?</p><button class="btn mini" data-act="redo">Record it again</button>`;
-    else if(cur === 'robot') panel = `<span class="onair">On the mic</span>
+  else if(mine && (rec || (sending && sending.state === 'up'))) panel = `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><h2>Sending your verse…</h2>`;
+  else if(mine && sending) panel = `<h2>Your verse did not send</h2><p class="small">Check the internet connection. Your recording is still here.</p>
+        <button class="btn pink big" data-act="resend">Send it again</button><button class="btn mini" data-act="redo">Record a new one</button>`;
+  else if(mine) panel = `<h2>Your turn, ${esc(P.name)}!</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. You get a 4-beat count-in, then go.</p>
+        <button class="btn pink big" data-act="drop">Drop the beat</button>
+        <p class="small">${last && last.by !== me.pid && !heard.has(last.id) && !last.robot ? 'Tip: listen to their verse first, then answer it.' : 'Headphones sound best. The mic switches off when your verse ends.'}</p>`;
+  else if(cur === 'robot') panel = bot ? `<span class="onair">On the mic</span>
         <div id="botcount" class="count">4</div>
         <div id="botbars" style="display:grid;gap:12px;width:100%;justify-items:center" hidden>
           <div class="botline" id="botline"></div><div class="small" id="botnext"></div><div class="track"><i id="botprog"></i></div></div>
-        ${bot && !bot.voiced ? '<p class="small">No voice for this language on this device. Read along!</p>' : ''}`;
-    else panel = `<span class="onair">On the mic</span><h2>${esc(P.name)} is rapping</h2>
-        <div class="eq">${[40, 75, 55, 95, 60, 85, 45].map(k => `<i style="--k:${k}"></i>`).join('')}</div><p class="small">You will hear the verse as soon as it is done.</p>`;
-  } else {
-    const v = curVerse(), has = clips.has(v.id), now = playing && playing.id === v.id, done = heard.has(v.id);
-    const crowd = crowdOf(v), got = crowd.filter(p => v.ratings[p]).length;
-    if(v.robot) panel = `<h2>That was: ${esc(P.name)}</h2><div class="lyrics">${v.lines.map(esc).join('<br>')}</div>${judgeCard(v)}
-      <button class="btn pink big" data-act="next">${t.i + 1 >= s.rounds * 2 ? 'See the results' : 'Next verse'}</button>`;
-    else panel = `<h2>${now ? 'Now playing' : 'That was'}: ${esc(P.name)}</h2>
-      ${has ? `<div class="track"><i id="playprog" style="${now ? '' : 'width:100%'}"></i></div>
-               <div class="row" style="justify-content:center"><button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${now ? 'Start over' : 'Play it again'}</button></div>`
-            : `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><p class="small">Getting the verse…</p>`}
-      ${S.solo ? '' : canRate(me.pid, v) ? micsRow(v) : `<p class="small">${v.by === me.pid ? 'The crowd is rating your verse.' : 'The crowd is rating this verse.'}</p>`}
-      ${done ? judgeCard(v) : `<p class="small">Boombot is listening…</p>`}
-      ${S.solo ? '' : `<p class="small">${got} of ${crowd.length} crowd rating${crowd.length === 1 ? '' : 's'} in</p>`}
-      ${isHost ? `<button class="btn pink big" data-act="next">${t.i + 1 >= s.rounds * 2 ? 'See the results' : 'Next verse'}</button>` : `<p class="small">Waiting for ${esc(hostName)} to continue…</p>`}`;
-  }
+        ${!bot.voiced ? '<p class="small">No voice for this language on this device. Read along!</p>' : ''}`
+      : `<h2>${esc(P.name)} is up next</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. Listen and read along.</p><button class="btn pink big" data-act="robotgo">Bring it on</button>`;
+  else if(recLive()) panel = `<span class="onair">On the mic</span><h2>${esc(P.name)} is rapping now</h2>
+        <div class="eq">${[40, 75, 55, 95, 60, 85, 45].map(k => `<i style="--k:${k}"></i>`).join('')}</div><p class="small">The verse shows up here as soon as it is done.</p>`;
+  else panel = `<h2>Waiting for ${esc(P.name)}</h2><p class="small">${esc(P.name)} can answer any time, now or later. The room stays open until ${fmtDay(closesAt)}, and the verse shows up here.</p>
+        ${myRoom ? `<button class="btn sun" data-act="remind">Remind ${esc(P.name)}</button>` : `<button class="btn pink" data-act="join">Join the crowd to rate verses</button>`}`;
   return `<div class="hud"><span>Round ${round} of ${s.rounds}</span><span class="t">${esc(s.topic)}</span></div>
     <div class="face">${fighter(s.a, cur === s.a, tot[s.a] || 0)}<span class="vs">VS</span>${fighter(s.b, cur === s.b, tot[s.b] || 0)}</div>
+    ${last ? versePanel(last) : ''}
     <section class="panel">${panel}</section>
-    ${isHost ? `<div class="hostbar"><button class="btn mini" data-act="end">${S.solo ? 'Quit battle' : 'End battle'}</button></div>` : ''}`;
+    <div class="hostbar">${S.solo ? '<button class="btn mini" data-act="end">Quit battle</button>' : `<button class="btn mini" data-act="home">Back to home</button>${canSteer() && !roomClosed ? '<button class="btn mini" data-act="end">End battle</button>' : ''}`}</div>`;
 }
+let shareOpen = false;
 function resultsView(){
-  const s = S.set, tot = totals(false), a = tot[s.a] || 0, b = tot[s.b] || 0, tie = a === b, w = a >= b ? s.a : s.b;
-  const W = S.players[w] || { name:'?', av:{} }, hostName = S.players[S.host] ? S.players[S.host].name : 'the host';
+  const s = S.set, tot = totals(), a = tot[s.a] || 0, b = tot[s.b] || 0, tie = a === b, w = a >= b ? s.a : s.b;
+  const W = S.players[w] || { name:'?', av:{} };
+  const need = S.verses.filter(v => !v.robot && !v.skipped), ready = need.length && need.every(v => clips.has(v.id));
   const rows = S.verses.map(v => { const P = S.players[v.by] || { name:'?' }, sc = verseScore(v);
     return `<div class="vrow"><div class="vhead"><strong>Round ${v.round} · ${esc(P.name)}</strong>
-      ${v.skipped ? '<span class="pill">Skipped</span>' : v.robot ? '<span class="pill">Robot</span>' : clips.has(v.id) ? `<button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${playing && playing.id === v.id ? 'Start over' : 'Play'}</button>` : ''}</div>
-      ${v.skipped ? '' : `<div class="sum"><span class="pill">Flow ${v.judge.flow}</span><span class="pill">Energy ${v.judge.energy}</span><span class="pill">Stamina ${v.judge.stamina}</span>${S.solo ? '' : `<span class="pill">Crowd ${sc.crowd}/20</span>`}<span class="pill tot">${sc.total}</span></div>`}</div>`; }).join('');
+      ${v.skipped ? '<span class="pill">Skipped</span>' : v.robot ? '<span class="pill">Robot</span>' : clips.has(v.id) ? `<button class="btn mini teal" data-act="replay" data-id="${esc(v.id)}">${playing && playing.id === v.id ? 'Start over' : 'Play'}</button>` : '<span class="pill">Loading…</span>'}</div>
+      ${v.skipped ? '' : `<div class="sum"><span class="pill">Flow ${v.judge.flow}</span><span class="pill">Energy ${v.judge.energy}</span><span class="pill">Stamina ${v.judge.stamina}</span>${S.solo || v.robot ? '' : `<span class="pill">Crowd ${sc.crowd}/20</span>`}<span class="pill tot">${sc.total}</span></div>`}
+      ${!S.solo && canRate(me.pid, v) ? micsRow(v) : ''}</div>`; }).join('');
+  const link = shareLink();
   return `<div class="winner">${tie ? `<div class="crown">It's a tie!</div><p>${a} points each. Settle it with a rematch.</p>`
       : `<span class="lab" style="color:#CFC4F2">Winner</span>${avHTML(W.av)}<div class="crown">${esc(W.name)}</div>`}</div>
     <div class="face">${fighter(s.a, tie || w === s.a, a)}<span class="vs">VS</span>${fighter(s.b, tie || w === s.b, b)}</div>
     <section class="card"><h2>Every verse</h2>${rows || '<p>No verses were recorded.</p>'}
-      <p class="small">${S.solo ? 'Each verse scores up to 30 from Boombot.' : 'Each verse scores up to 30 from Boombot and up to 20 from the crowd.'}</p></section>
-    ${S.verses.some(v => clips.has(v.id)) ? `<button class="btn sun big" data-act="download" ${dlBusy ? 'disabled' : ''}>${dlBusy ? 'Making the sound file…' : 'Download the battle'}</button>
-      <p class="small center">${S.solo ? 'Saves your verses with the beat as one sound file. The robot\'s voice cannot be recorded.' : 'Saves every verse with the beat as one sound file (WAV).'}</p>` : ''}
-    ${isHost ? `<div class="row"><button class="btn pink grow" data-act="rematch">Rematch</button><button class="btn grow" data-act="end">${S.solo ? 'Back to start' : 'Back to the lobby'}</button></div>`
-             : `<p class="center small">Waiting for ${esc(hostName)} to pick what happens next…</p>`}`;
+      <p class="small">${S.solo ? 'Each verse scores up to 30 from Boombot.' : 'Each verse scores up to 30 from Boombot and up to 20 from the crowd. The crowd can keep rating until the room closes.'}</p></section>
+    ${need.length ? `<div class="row"><button class="btn sun grow" data-act="send" ${dlBusy || !ready ? 'disabled' : ''}>${dlBusy ? 'Making the sound file…' : ready ? 'Send the battle' : 'Loading the verses…'}</button>
+        <button class="btn grow" data-act="download" ${dlBusy || !ready ? 'disabled' : ''}>Download</button></div>
+      <p class="small center">${S.solo ? 'One sound file with your verses and the beat. The robot\'s voice cannot be recorded.' : 'One sound file with every verse and the beat. Send opens your phone\'s share menu: Telegram, WhatsApp, email and more.'}</p>` : ''}
+    ${shareOpen && link ? `<section class="card share"><h2>Share this battle</h2><p class="small">Anyone with this link can watch and listen to the battle until ${fmtDay(new Date((closesAt ? closesAt.getTime() : Date.now() + 7 * 864e5) + 23 * 864e5))}.</p>
+        <input class="field" id="sharelink" readonly value="${esc(link)}">
+        <div class="row"><button class="btn mini sun" data-act="copylink">Copy link</button>
+          <a class="btn mini" target="_blank" rel="noopener" href="https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText())}">Telegram</a>
+          <a class="btn mini" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(shareText() + ' ' + link)}">WhatsApp</a>
+          <a class="btn mini" href="mailto:?subject=${encodeURIComponent('Our Rhyme Rumble battle')}&body=${encodeURIComponent(shareText() + '\n\n' + link)}">Email</a></div></section>` : ''}
+    ${canSteer() && !roomClosed ? `<div class="row"><button class="btn pink grow" data-act="rematch">Rematch</button><button class="btn grow" data-act="end">${S.solo ? 'Back to start' : 'Back to the lobby'}</button></div>` : ''}
+    ${!S.solo && !canSteer() ? `<button class="btn pink big" data-act="battleme">Battle me: start your own room</button>` : ''}
+    ${S.solo ? '' : '<div class="center"><button class="btn mini" data-act="home">Back to home</button></div>'}`;
+}
+
+/* ---------- sharing ------------------------------------------------ */
+const roomLink = c => location.origin + location.pathname + '#' + c;
+const shareLink = () => S && !S.solo && roomCode ? roomLink(roomCode) : '';
+function shareText(){
+  const s = S.set, tot = totals(), A = (S.players[s.a] || {}).name, B = (S.players[s.b] || {}).name;
+  return `${A} vs. ${B} in Rhyme Rumble: ${tot[s.a] || 0} to ${tot[s.b] || 0}. Listen to the battle:`;
+}
+async function shareTo(title, text, url){
+  try{ if(navigator.share){ await navigator.share({ title, text, url }); return true; } }catch(e){ if(e && e.name === 'AbortError') return true; }
+  try{ await navigator.clipboard.writeText(url); toast('Link copied. Paste it to your friend.'); return true; }catch{ toast(url, 12000); return false; }
+}
+async function invite(){
+  const url = roomLink(S.code), text = `Join my ${GAME} room ${S.code}:`;
+  if(navigator.share && matchMedia('(pointer:coarse)').matches) return shareTo(GAME, text, url);
+  try{ await navigator.clipboard.writeText(url); toast('Invite link copied. Send it to your crew!'); }catch{ toast(url, 12000); }
+}
+function remind(){ const P = S.players[performer()] || { name:'' }; shareTo(GAME, `${P.name}, it's your turn in our Rhyme Rumble battle! Tap to answer:`, roomLink(S.code)); }
+async function sendBattle(){
+  if(dlBusy || !S) return; dlBusy = true; render();
+  let blob = null; try{ blob = await renderBattle(); }catch(e){ console.warn(e); }
+  dlBusy = false;
+  if(!blob){ render(); return toast('Could not make the sound file on this device.'); }
+  const file = new File([blob], 'rhyme-rumble-battle.wav', { type:'audio/wav' }), link = shareLink();
+  try{
+    if(navigator.canShare && navigator.canShare({ files:[file] })){
+      await navigator.share({ files:[file], title:'Rhyme Rumble battle', text:link ? shareText() + ' ' + link : 'Our Rhyme Rumble battle' });
+      render(); return;
+    }
+  }catch(e){ if(e && e.name === 'AbortError'){ render(); return; } }
+  if(link){ shareOpen = true; render(); const el = $('#sharelink'); if(el) el.scrollIntoView({ block:'center' }); }
+  else { saveBlob(blob); render(); }
+}
+function saveBlob(blob){
+  const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = 'rhyme-rumble-battle.wav'; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000); toast('Battle saved as rhyme-rumble-battle.wav');
 }
 
 /* ---------- events ------------------------------------------------- */
-function saveMe(){ store.set('rr.me', { name:me.name, av:me.av }); if(S) send({ t:'me', name:me.name, av:me.av }); }
-async function invite(){
-  const url = location.origin + location.pathname + location.search + '#' + S.code;
-  const text = `Join my ${GAME} room ${S.code}: ${url}`;
-  try{ if(navigator.share && matchMedia('(pointer:coarse)').matches){ await navigator.share({ title:GAME, text, url }); return; } }catch(e){ if(e && e.name === 'AbortError') return; }
-  try{ await navigator.clipboard.writeText(url); toast('Invite link copied. Send it to your crew!'); }catch{ toast(url, 12000); }
+function saveMe(){
+  store.set('rr.me', { name:me.name, av:me.av });
+  if(S && myRoom && !S.solo) mutate(d => { if(!d.players[me.pid]) return false; d.players[me.pid] = { name:me.name, av:me.av }; });
+  else if(S && S.solo){ S.players[me.pid] = { name:me.name, av:me.av }; }
 }
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]'); if(!el) return;
@@ -1291,43 +1282,51 @@ document.addEventListener('click', e => {
     case 'cancelcreator': view = creatorBack; render(); break;
     case 'savecreator': me.name = cleanName(draft.name); me.av = cleanAv(draft.av); view = creatorBack; saveMe(); render(); break;
     case 'create': createRoom(); break;
-    case 'leave': leave(); break;
-    case 'home': view = 'home'; render(); scrollTo(0, 0); break;
+    case 'room': goRoom(el.dataset.code); break;
+    case 'join': joinHere(); break;
+    case 'home': if(S) leave(); else { view = 'home'; render(); loadRecent(); } scrollTo(0, 0); break;
+    case 'leave': { const c = roomCode; rules.leaveLobby().then(ok => { if(ok){ forgetRoom(c); leave(); } }); break; }
     case 'solo': view = 'solo'; render(); scrollTo(0, 0); break;
     case 'soloset': { const k = el.dataset.k, v = el.dataset.v; solo[k] = k === 'bars' || k === 'rounds' ? Number(v) : v; if(k === 'beat') previewBeat(v); render(); break; }
     case 'solostart': startSolo(); break;
     case 'robotgo': robotGo(); break;
-    case 'download': downloadBattle(); break;
+    case 'download': (async () => { if(dlBusy) return; dlBusy = true; render(); try{ const b = await renderBattle(); if(b) saveBlob(b); else toast('There are no recorded verses to save.'); }catch(err){ console.warn(err); toast('Could not make the sound file on this device.'); } dlBusy = false; render(); })(); break;
+    case 'send': sendBattle(); break;
+    case 'copylink': { const v = shareLink(); navigator.clipboard.writeText(v).then(() => toast('Link copied.'), () => { const i = $('#sharelink'); if(i){ i.select(); } toast('Select the link and copy it.'); }); break; }
+    case 'battleme': createRoom(); break;
     case 'invite': invite(); break;
+    case 'remind': remind(); break;
     case 'miccheck': micCheck(); break;
     case 'hear': previewBeat(S.set.beat); break;
     case 'drop': startVerse(); break;
     case 'done': finishVerse(); break;
-    case 'redo': net.outVerse = null; send({ t:'cancel' }); break;
-    case 'replay': { const v = S.verses.find(x => x.id === el.dataset.id); if(v) playVerse(v); break; }
-    case 'rate': audio(); send({ t:'rate', id:el.dataset.id, n:Number(el.dataset.n) }); break;
+    case 'resend': sendVerse(); break;
+    case 'redo': sending = null; clearRecFlag(); render(); break;
+    case 'replay': { audio(); const v = S.verses.find(x => x.id === el.dataset.id); if(v) playVerse(v); break; }
+    case 'rate': audio(); rules.rate(el.dataset.id, Number(el.dataset.n)); break;
   }
-  if(!isHost || !S) return;
+  if(!S || !myRoom || roomClosed) return;
   switch(act){
-    case 'pick': host.pick(el.dataset.pid); break;
-    case 'set': { const k = el.dataset.k, v = el.dataset.v; host.set(k, k === 'beat' ? v : Number(v)); if(k === 'beat') previewBeat(v); break; }
-    case 'spin': { let t; do t = TOPICS[rnd(TOPICS.length)]; while(t === S.set.topic); host.set('topic', t); break; }
-    case 'start': host.start(); break;
-    case 'next': host.next(); break;
-    case 'end': if(S.solo) leave(); else host.end(); break;
-    case 'rematch': host.rematch(); break;
+    case 'pick': rules.pick(el.dataset.pid); break;
+    case 'set': { const k = el.dataset.k, v = el.dataset.v; rules.set(k, k === 'beat' ? v : Number(v)); if(k === 'beat') previewBeat(v); break; }
+    case 'spin': { let t; do t = TOPICS[rnd(TOPICS.length)]; while(t === S.set.topic); rules.set('topic', t); break; }
+    case 'start': rules.start(); break;
+    case 'end': if(S.solo) leave(); else if(canSteer()) rules.end(); break;
+    case 'rematch': if(canSteer()) rules.rematch(); break;
   }
 });
 document.addEventListener('input', e => {
   if(e.target.id === 'rapname' && draft) draft.name = e.target.value;
   if(e.target.id === 'code'){ joinCode = e.target.value = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6); }
 });
-document.addEventListener('submit', e => { e.preventDefault(); if(e.target.dataset.form === 'join') joinRoom($('#code').value); });
-window.addEventListener('pagehide', () => { if(S && net.key){ if(isHost) netSend('a', { t:'closed' }); else netSend('h', { t:'bye' }); } });
+document.addEventListener('submit', e => { e.preventDefault(); if(e.target.dataset.form === 'join') goRoom($('#code').value); });
+window.addEventListener('hashchange', () => { const c = (location.hash || '').replace(/[^A-Za-z]/g, '').toUpperCase(); if(c.length === 6 && c !== roomCode) goRoom(c); });
 
 /* ---------- boot --------------------------------------------------- */
 joinCode = (location.hash || '').replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 6);
+recent = store.get('rr.rooms', []);
 render();
+if(joinCode.length === 6 && API) goRoom(joinCode); else loadRecent();
 </script>
 </body>
 </html>
