@@ -195,6 +195,14 @@ button.tile{cursor:pointer}
 .rw.no{text-decoration:line-through; color:var(--muted)}
 .vsrow{display:grid; grid-template-columns:1fr 1fr; gap:12px}
 .vsrow > div{display:grid; gap:6px; align-content:start; min-width:0}
+.wk{background:var(--paper) radial-gradient(circle at 100% 0, rgba(255,79,139,.18), transparent 55%)}
+.winrow{display:flex; gap:12px; align-items:center; border-top:2px dashed #C9BEEA; padding-top:12px}
+.winrow .av,.entry .av{width:58px; flex:none}
+.entry{display:flex; gap:10px; align-items:center; padding:10px 0; border-top:2px dashed #C9BEEA}
+.entry:first-of-type{border-top:0}
+.entry.voted{background:linear-gradient(90deg, rgba(255,206,31,.35), transparent); border-radius:12px; padding-inline:6px}
+.entry .nm{font-weight:700; overflow-wrap:anywhere}
+.eacts{display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end}
 #toast{position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 18px); margin:0 auto; max-width:520px; z-index:20;
   background:var(--ink); color:var(--paper); border:3px solid var(--paper); border-radius:14px; padding:12px 16px; font-weight:500; text-align:center; overflow-wrap:anywhere}
 .busy{min-height:55vh; display:grid; place-content:center; gap:16px; text-align:center}
@@ -359,7 +367,7 @@ function tone(ac, out, t, freq, dur, peak, wave, cutoff){
   o.connect(f); f.connect(env(ac, out, t, peak, dur, .012)); o.start(t); o.stop(t + dur + .03);
 }
 function scheduleBeat(ac, out, id, t0, bars, countIn){
-  const b = BEATS[id] || BEATS.boom, step = 60 / b.bpm / 4, bar = step * 16;
+  const b = beatOf(id), step = 60 / b.bpm / 4, bar = step * 16;
   let t = t0;
   if(countIn){ for(let i = 0; i < 4; i++) tone(ac, out, t0 + i * step * 4, i ? 880 : 1320, .09, .35, 'square', 4000); t += bar; }
   for(let n = 0; n < bars; n++){
@@ -1107,6 +1115,7 @@ const BADGES = {
   fire:   'On fire: 25 or more from Boombot in a quick round',
   machine:'Rhyme machine: 6 rhymes in one rush',
   robo:   'Robot beater: beat DJ Megabyte at Rhyme rush',
+  weekwin:'Beat of the week winner',
   p100:   '100 points', p500:'500 points', p1000:'1000 points'
 };
 let pts = Object.assign({ total:0, best:{ words:0, quick:0, rush:0 }, badges:[] }, store.get('rr.pts', {}));
@@ -1128,6 +1137,7 @@ const barsFor30 = beat => clamp(Math.round(30 / (240 / BEATS[beat].bpm)), 4, 16)
 function openMini(game){
   stopAudio(); audio();
   mini = { game, stage:'intro' };
+  if(game === 'challenge'){ ch.entries = null; loadChallenge(true); }
   if(game === 'words') mini.words = pickWords(miniSet.lang);
   view = 'mini'; render(); scrollTo(0, 0);
 }
@@ -1137,7 +1147,7 @@ async function miniRecord(){
   const ac = audio(); let mic;
   try{ mic = await openMic(); }catch(e){ return toast(micHelp(e), 7000); }
   if(!mini || view !== 'mini'){ mic.close(); return; }
-  const beat = miniSet.beat, bars = mini.game === 'quick' ? 4 : barsFor30(beat);
+  const beat = mini.game === 'challenge' ? weekBeat(ch.info.week) : miniSet.beat, bars = mini.game === 'quick' ? 4 : mini.game === 'challenge' ? barsFor60(beat) : barsFor30(beat);
   const out = ac.createGain(); out.gain.value = .8; out.connect(MASTER);
   const sch = scheduleBeat(ac, out, beat, ac.currentTime + .45, bars, true);
   const lat = clamp((ac.outputLatency || 0) + (ac.baseLatency || 0) + mic.inLat, 0, .35);
@@ -1158,11 +1168,12 @@ function finishMini(){
   const x = new Float32Array(n);
   for(const { f, b } of chunks){ const off = f - f0; if(off >= n || off + b.length <= 0) continue;
     const a = Math.max(0, -off), z = Math.min(b.length, n - off); x.set(b.subarray(a, z), off + a); }
-  const y = downsample(x, sr, RATE), j = judgeVerse(y, BEATS[r.beat].bpm, r.bars);
+  const y = downsample(x, sr, RATE), j = judgeVerse(y, beatOf(r.beat).bpm, r.bars);
   let pk = 0; for(let i = 0; i < y.length; i++){ const a = Math.abs(y[i]); if(a > pk) pk = a; }
   if(pk > .02){ const g = Math.min(8, .92 / pk); for(let i = 0; i < y.length; i++) y[i] *= g; }
   const id = 'mini' + rid(6); clips.set(id, makeClip(muEncode(y)));
   mini.take = { id, beat:r.beat, bars:clamp(Math.ceil((y.length / RATE) / r.sch.bar - .02), 1, r.bars) };
+  mini.result = null; mini.sendErr = null;
   mini.judge = { flow:c10(j.flow), energy:c10(j.energy), stamina:c10(j.stamina) };
   mini.stage = 'done'; mini.used = [];
   if(mini.game === 'quick'){ const sc = mini.judge.flow + mini.judge.energy + mini.judge.stamina; mini.result = award(sc, 'quick', sc, sc >= 25 ? ['fire'] : []); }
@@ -1244,6 +1255,7 @@ function takeControls(){
   return `<button class="btn teal mini" data-act="miniplay">${now ? 'Start over' : 'Play it back'}</button>`;
 }
 function miniView(){
+  if(mini.game === 'challenge') return challengeView();
   const m = mini, back = '<div class="center"><button class="btn mini" data-act="minihome">Back</button></div>';
   if(m.game === 'words'){
     const words = `<div class="wordrow">${m.words.map(w => `<span class="bigword">${esc(w)}</span>`).join('')}</div>`;
@@ -1296,6 +1308,139 @@ function miniView(){
     <button class="btn pink big" data-act="rushgo">New word, go again</button>${back}`;
 }
 
+/* ---------- beat of the week ------------------------------------------
+   A new beat every week, made from the week's number. Everyone can send
+   one verse of up to about 60 seconds and give one vote. Last week's
+   winner is shown on the home screen.                                 */
+const WEEK_BEATS = {};
+const beatOf = id => BEATS[id] || WEEK_BEATS[id] || BEATS.boom;
+function weekBeat(week){
+  const id = 'wk' + week; if(WEEK_BEATS[id]) return id;
+  let h = 2166136261; for(const c of week) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  const r = () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; };
+  const bases = ['boom', 'trap', 'old', 'chill'], base = BEATS[bases[Math.floor(r() * 4)]];
+  const kick = base.kick.split('');
+  for(let k = 0; k < 2; k++){ const s = [3, 5, 9, 11, 13, 15][Math.floor(r() * 6)]; kick[s] = kick[s] === 'x' ? '.' : 'x'; }
+  kick[0] = 'x';
+  const shift = [-2, 0, 2, 3, 5][Math.floor(r() * 5)];
+  WEEK_BEATS[id] = Object.assign({}, base, { name:'Week ' + week.split('W')[1] + ' beat', bpm:base.bpm + Math.round(r() * 10 - 5), kick:kick.join(''), root:base.root + shift });
+  return id;
+}
+const barsFor60 = id => clamp(Math.round(60 / (240 / beatOf(id).bpm)), 8, 32);
+let ch = { info:null, entries:null, prev:null, myVote:null, loading:false, err:null };
+function chIdent(){ let id = store.get('rr.chid', null); if(!id || !id.pid){ id = { pid:rid(12), token:rid(32), joined:false }; store.set('rr.chid', id); } return id; }
+async function chEnsure(){
+  const id = chIdent(); if(id.joined) return id;
+  const r = await rpc('rr_ch_join', { p_pid:id.pid, p_token:id.token });
+  if(r === 'bad_token'){ const n = { pid:rid(12), token:rid(32), joined:false }; store.set('rr.chid', n); return chEnsure(); }
+  if(r !== 'ok') throw Object.assign(new Error('join'), { code:'server' });
+  id.joined = true; store.set('rr.chid', id); return id;
+}
+async function loadChallenge(full){
+  if(!API) return;
+  if(ch.loading){ if(full) ch.wantFull = true; return; }      // run again with the list once the current load finishes
+  ch.loading = true; ch.wantFull = false;
+  try{
+    ch.info = await rpc('rr_ch_info', {});
+    weekBeat(ch.info.week); weekBeat(ch.info.prev);
+    const prev = await rpc('rr_ch_list', { p_week:ch.info.prev });
+    ch.prev = prev && prev.length ? prev[0] : null;
+    if(ch.prev && ch.prev.pid === chIdent().pid && !pts.badges.includes('weekwin')){ pts.badges.push('weekwin'); store.set('rr.pts', pts); }
+    if(full){ ch.entries = await rpc('rr_ch_list', { p_week:ch.info.week }); ch.myVote = await rpc('rr_ch_myvote', { p_pid:chIdent().pid }); }
+    ch.err = null;
+  }catch(e){ ch.err = e; }
+  ch.loading = false;
+  if(ch.wantFull) return loadChallenge(true);
+  if(view === 'home' || (view === 'mini' && mini && mini.game === 'challenge')) render();
+}
+async function chPlay(week, pid, name){
+  const id = 'ch' + week + pid;
+  if(!clips.has(id)){
+    toast('Getting ' + name + "'s verse…", 2500);
+    try{
+      const parts = await rpc('rr_ch_audio', { p_week:week, p_pid:pid });
+      if(!Array.isArray(parts)) return toast('That verse is not available.');
+      const bins = parts.map(b => Uint8Array.from(atob(b), c => c.charCodeAt(0))), pcm = new Uint8Array(bins.reduce((a, b) => a + b.length, 0));
+      let o = 0; for(const b of bins){ pcm.set(b, o); o += b.length; }
+      clips.set(id, makeClip(pcm));
+    }catch(e){ return toast(netHelp(e)); }
+  }
+  const beat = weekBeat(week); audio(); playVerse({ id, beat, bars:clamp(Math.ceil(clips.get(id).f.length / RATE / (240 / beatOf(beat).bpm)), 1, 32) });
+}
+async function chSend(){
+  const m = mini; if(!m || !m.take || m.sending) return;
+  m.sending = true; m.sendErr = null; render();
+  try{
+    const id = await chEnsure(), pcm = clips.get(m.take.id).pcm, n = Math.ceil(pcm.length / PART);
+    for(let i = 0; i < n; i++){
+      const part = pcm.subarray(i * PART, (i + 1) * PART); let s = '';
+      for(let k = 0; k < part.length; k += 0x8000) s += String.fromCharCode.apply(null, part.subarray(k, k + 0x8000));
+      let ok = false;
+      for(let t = 0; t < 3 && !ok; t++){ try{ ok = await rpc('rr_ch_upload', { p_pid:id.pid, p_token:id.token, p_part:i, p_parts:n, p_data:btoa(s) }); }catch{ await sleep(1500); } }
+      if(!ok) throw Object.assign(new Error('upload'), { code:'server' });
+    }
+    const r = await rpc('rr_ch_enter', { p_pid:id.pid, p_token:id.token, p_name:me.name, p_av:me.av, p_judge:m.judge, p_parts:n });
+    if(r !== 'ok') throw Object.assign(new Error(r), { code:'server' });
+    const first = !(pts.chEntered || []).includes(ch.info.week);
+    if(first){ pts.chEntered = [...(pts.chEntered || []), ch.info.week].slice(-10); }
+    m.result = award(first ? 20 : 0, 'challenge', 0, []);
+    m.stage = 'sent';
+  }catch(e){ m.sendErr = netHelp(e); }
+  m.sending = false; render(); loadChallenge(true);
+}
+async function chVote(pid){
+  try{
+    const id = await chEnsure();
+    if(pid === id.pid) return toast("You can't vote for your own verse.");
+    const ok = await rpc('rr_ch_vote', { p_pid:id.pid, p_token:id.token, p_target:pid });
+    if(!ok) return toast('Could not save the vote. Try again.');
+    const first = !(pts.chVoted || []).includes(ch.info.week);
+    if(first){ pts.chVoted = [...(pts.chVoted || []), ch.info.week].slice(-10); award(5, 'challenge', 0, []); }
+    ch.myVote = pid; toast(first ? 'Vote saved. +5 points' : 'Vote changed.'); loadChallenge(true);
+  }catch(e){ toast(netHelp(e)); }
+}
+const daysLeft = () => { if(!ch.info) return ''; const ms = new Date(ch.info.ends_at) - Date.now(), d = Math.floor(ms / 864e5), hrs = Math.floor(ms / 36e5);
+  return d >= 1 ? `${d} day${d > 1 ? 's' : ''} left` : hrs >= 1 ? `${hrs} hour${hrs > 1 ? 's' : ''} left` : 'ends soon'; };
+function challengeCard(){
+  if(!API) return '';
+  if(!ch.info) return `<section class="card wk"><h2>Beat of the week</h2><p class="small">${ch.err ? 'Could not load this week\'s challenge.' : 'Loading…'}</p></section>`;
+  const b = beatOf(weekBeat(ch.info.week)), p = ch.prev;
+  return `<section class="card wk"><div class="row" style="justify-content:space-between"><h2>Beat of the week</h2><span class="pill">${daysLeft()}</span></div>
+    <p>${esc(b.name)} · ${b.bpm} BPM. Rap up to a minute on it, then vote for your favourite verse.</p>
+    <div class="row"><button class="btn pink grow" data-act="mini" data-game="challenge">Join the challenge</button><button class="btn mini" data-act="hearweek">Hear the beat</button></div>
+    ${p ? `<div class="winrow">${avHTML(p.av)}<div class="grow"><span class="lab">Last week's winner</span><div class="name">${esc(p.name)}</div><span class="small">${p.votes} vote${p.votes === 1 ? '' : 's'}</span></div>
+      <button class="btn mini teal" data-act="chplay" data-week="${esc(ch.info.prev)}" data-pid="${esc(p.pid)}" data-name="${esc(p.name)}">Play</button></div>` : ''}</section>`;
+}
+function challengeView(){
+  const m = mini, back = '<div class="center"><button class="btn mini" data-act="minihome">Back</button></div>';
+  if(!ch.info) return `<section class="card"><h2>Beat of the week</h2><p>${ch.err ? esc(netHelp(ch.err)) : 'Loading this week\'s challenge…'}</p></section>${back}`;
+  const beatId = weekBeat(ch.info.week), b = beatOf(beatId), myPid = chIdent().pid, list = ch.entries || [];
+  const mineIn = list.some(e => e.pid === myPid);
+  if(m.stage === 'rec') return `<section class="panel stagepanel"><div class="bigword">${esc(b.name)}</div>${recPanel()}</section>`;
+  if(m.stage === 'done'){
+    return `<section class="card"><h2>Your verse</h2>
+      <div class="judge"><div class="who"><span class="bot">${BOT_SVG}</span><div class="grow"><span class="lab">Boombot says</span><div style="font-weight:700">${esc(judgeSays(m.judge))}</div></div></div>
+        ${miniStat('Flow', m.judge.flow)}${miniStat('Energy', m.judge.energy)}${miniStat('Stamina', m.judge.stamina)}</div>
+      <div class="row">${takeControls()}<button class="btn mini" data-act="chredo">Record again</button></div>
+      <p class="small">${mineIn ? 'Sending replaces the verse you already entered this week.' : 'Everyone who opens the game can hear your verse and vote until the week ends.'}</p>
+      ${m.sendErr ? `<p style="font-weight:700">${esc(m.sendErr)}</p>` : ''}
+      <button class="btn pink big" data-act="chsend" ${m.sending ? 'disabled' : ''}>${m.sending ? 'Sending…' : 'Send my entry'}</button></section>${back}`;
+  }
+  const rows = list.map((e, i) => { const sc = (e.judge.flow || 0) + (e.judge.energy || 0) + (e.judge.stamina || 0), mine = e.pid === myPid, voted = ch.myVote === e.pid;
+    return `<div class="entry${voted ? ' voted' : ''}">${avHTML(e.av)}<div class="grow"><div class="nm">${i + 1}. ${esc(e.name)}${mine ? ' <span class="badge you">You</span>' : ''}</div>
+      <span class="small">${e.votes} vote${e.votes === 1 ? '' : 's'} · Boombot ${sc}/30</span></div>
+      <div class="eacts"><button class="btn mini teal" data-act="chplay" data-week="${esc(ch.info.week)}" data-pid="${esc(e.pid)}" data-name="${esc(e.name)}">Play</button>
+      ${mine ? '' : `<button class="btn mini ${voted ? 'sun' : ''}" data-act="chvote" data-pid="${esc(e.pid)}" aria-pressed="${voted}">${voted ? 'Voted' : 'Vote'}</button>`}</div></div>`; }).join('');
+  return `${m.stage === 'sent' && m.result ? `<div class="won"><div class="plus">Entry sent${m.result.points ? ` · +${m.result.points} points` : ''}</div><span class="small">Now listen to the others and vote for your favourite.</span></div>` : ''}
+    <section class="card wk"><div class="row" style="justify-content:space-between"><h2>Beat of the week</h2><span class="pill">${daysLeft()}</span></div>
+      <p><b>${esc(b.name)}</b> · ${b.bpm} BPM · about ${barsFor60(beatId)} bars, one minute. One entry and one vote per player each week. The verse with the most votes wins and is shown on everyone's home screen next week.</p>
+      <div class="row"><button class="btn pink grow" data-act="minirec">${mineIn ? 'Record a new entry' : 'Record my entry'}</button><button class="btn mini" data-act="hearweek">Hear the beat</button></div>
+      <p class="small">Headphones help. Roast the topic, not the person.</p></section>
+    <section class="card"><div class="row" style="justify-content:space-between"><h2>Entries (${list.length})</h2><button class="btn mini" data-act="chrefresh">Refresh</button></div>
+      ${ch.entries === null ? '<p class="small">Loading…</p>' : rows || '<p>No entries yet. Be the first!</p>'}
+      ${list.length ? '<p class="small">Tap Vote on your favourite. You can change your vote until the week ends.</p>' : ''}</section>${back}`;
+}
+
 /* ---------- screens ------------------------------------------------ */
 const fmtDay = d => d ? d.toLocaleDateString(undefined, { weekday:'short', day:'numeric', month:'short' }) : '';
 function render(){
@@ -1329,6 +1474,7 @@ function homeView(){
       <form class="row" data-form="join"><input id="code" class="field code grow" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDEF" value="${esc(joinCode)}">
       <button class="btn sun" type="submit">Join</button></form></div>
   </section>
+  ${challengeCard()}
   ${miniCard()}
   <section class="card">
     <h2>How a battle works</h2>
@@ -1544,7 +1690,7 @@ document.addEventListener('click', e => {
     case 'create': createRoom(); break;
     case 'room': goRoom(el.dataset.code); break;
     case 'join': joinHere(); break;
-    case 'home': if(S) leave(); else { view = 'home'; render(); loadRecent(); } scrollTo(0, 0); break;
+    case 'home': if(S) leave(); else { view = 'home'; render(); loadRecent(); } loadChallenge(false); scrollTo(0, 0); break;
     case 'leave': { const c = roomCode; rules.leaveLobby().then(ok => { if(ok){ forgetRoom(c); leave(); } }); break; }
     case 'solo': view = 'solo'; render(); scrollTo(0, 0); break;
     case 'soloset': { const k = el.dataset.k, v = el.dataset.v; solo[k] = k === 'bars' || k === 'rounds' ? Number(v) : v; if(k === 'beat') previewBeat(v); render(); break; }
@@ -1553,7 +1699,13 @@ document.addEventListener('click', e => {
     case 'download': (async () => { if(dlBusy) return; dlBusy = true; render(); try{ const b = await renderBattle(); if(b) saveBlob(b); else toast('There are no recorded verses to save.'); }catch(err){ console.warn(err); toast('Could not make the sound file on this device.'); } dlBusy = false; render(); })(); break;
     case 'send': sendBattle(); break;
     case 'mini': openMini(el.dataset.game); break;
-    case 'minihome': stopAudio(); abortRec(); if(mini) clearInterval(mini.timer); mini = null; view = 'home'; render(); scrollTo(0, 0); break;
+    case 'hearweek': if(ch.info) previewBeat(weekBeat(ch.info.week)); break;
+    case 'chplay': chPlay(el.dataset.week, el.dataset.pid, el.dataset.name); break;
+    case 'chvote': chVote(el.dataset.pid); break;
+    case 'chsend': chSend(); break;
+    case 'chredo': stopAudio(); mini.stage = 'intro'; mini.take = null; render(); break;
+    case 'chrefresh': loadChallenge(true); break;
+    case 'minihome': stopAudio(); abortRec(); if(mini) clearInterval(mini.timer); mini = null; view = 'home'; render(); loadChallenge(false); scrollTo(0, 0); break;
     case 'miniset': { const k = el.dataset.k; miniSet[k] = el.dataset.v; store.set('rr.mini', miniSet); if(k === 'beat') previewBeat(el.dataset.v); if(k === 'lang' && mini && mini.game === 'words') mini.words = pickWords(miniSet.lang); render(); break; }
     case 'newwords': mini.words = pickWords(miniSet.lang); render(); break;
     case 'minirec': miniRecord(); break;
@@ -1599,6 +1751,7 @@ joinCode = (location.hash || '').replace(/[^A-Za-z]/g, '').toUpperCase().slice(0
 recent = store.get('rr.rooms', []);
 render();
 if(joinCode.length === 6 && API) goRoom(joinCode); else loadRecent();
+loadChallenge(false);
 </script>
 </body>
 </html>
