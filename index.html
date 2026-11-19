@@ -204,6 +204,9 @@ button.tile{cursor:pointer}
 .entry.voted{background:linear-gradient(90deg, rgba(255,206,31,.35), transparent); border-radius:12px; padding-inline:6px}
 .entry .nm{font-weight:700; overflow-wrap:anywhere}
 .eacts{display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end}
+.hist{display:grid; gap:8px; padding:12px 0; border-top:2px dashed #C9BEEA}
+.hist:first-of-type{border-top:0; padding-top:0}
+.hhead{display:flex; gap:10px; justify-content:space-between; align-items:center; flex-wrap:wrap}
 #toast{position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom,0px) + 18px); margin:0 auto; max-width:520px; z-index:20;
   background:var(--ink); color:var(--paper); border:3px solid var(--paper); border-radius:14px; padding:12px 16px; font-weight:500; text-align:center; overflow-wrap:anywhere}
 .busy{min-height:55vh; display:grid; place-content:center; gap:16px; text-align:center}
@@ -338,11 +341,13 @@ function audio(){
   if(AC.state === 'suspended') AC.resume().catch(() => {});
   return AC;
 }
+const NOISES = new WeakMap();                // one noise burst per audio context, reused by every drum hit
 function noiseBuf(ac){
   if(ac === AC && NOISE) return NOISE;
+  if(NOISES.has(ac)) return NOISES.get(ac);
   const b = ac.createBuffer(1, ac.sampleRate, ac.sampleRate), d = b.getChannelData(0);
   for(let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-  if(ac === AC) NOISE = b; return b;
+  if(ac === AC) NOISE = b; else NOISES.set(ac, b); return b;
 }
 const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
 function env(ac, out, t, peak, dur, attack = .004){
@@ -529,7 +534,7 @@ function forgetRoom(code){ recent = store.get('rr.rooms', []).filter(c => c !== 
 const randCode = () => Array.from({ length:6 }, () => CODE_LETTERS[rnd(CODE_LETTERS.length)]).join('');
 function newState(code){
   return { code, host:me.pid, players:{}, order:[], phase:'lobby', verses:[], rec:null,
-    set:{ beat:'boom', bars:8, rounds:2, a:null, b:null, topic:TOPICS[0] } };
+    set:{ beat:'boom', bars:8, rounds:2, a:null, b:null, topic:TOPICS[0], mode:'async' } };
 }
 function toast(msg, ms = 4200){ const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => t.hidden = true, ms); }
 function setBusy(text){ view = 'busy'; busyText = text; render(); }
@@ -630,19 +635,22 @@ async function uploadVerse(id, pcm){
   }
   return true;
 }
-const fetching = new Set();
-async function fetchVerse(id){
-  if(clips.has(id) || fetching.has(id) || !roomCode) return;
-  fetching.add(id);
-  try{
-    const parts = await rpc('rr_verse', { p_code:roomCode, p_id:id });
-    if(Array.isArray(parts)){
-      const bins = parts.map(b => Uint8Array.from(atob(b), c => c.charCodeAt(0))), pcm = new Uint8Array(bins.reduce((a, b) => a + b.length, 0));
-      let o = 0; for(const b of bins){ pcm.set(b, o); o += b.length; }
-      clips.set(id, makeClip(pcm)); maybeAutoPlay(); render();
-    }
-  }catch{}
-  fetching.delete(id);
+const fetching = new Map();
+function fetchVerse(id){
+  if(clips.has(id) || !roomCode) return Promise.resolve();
+  if(fetching.has(id)) return fetching.get(id);
+  const code = roomCode, p = (async () => {
+    try{
+      const parts = await rpc('rr_verse', { p_code:code, p_id:id });
+      if(Array.isArray(parts)){
+        const bins = parts.map(b => Uint8Array.from(atob(b), c => c.charCodeAt(0))), pcm = new Uint8Array(bins.reduce((a, b) => a + b.length, 0));
+        let o = 0; for(const b of bins){ pcm.set(b, o); o += b.length; }
+        clips.set(id, makeClip(pcm)); maybeAutoPlay(); render();
+      }
+    }catch{}
+    fetching.delete(id);
+  })();
+  fetching.set(id, p); return p;
 }
 function leave(){
   stopAudio(); abortRec(); stopBot(); clearTimeout(pollT);
@@ -702,8 +710,8 @@ const rules = {
     mutate(d => { if(!d.set.a || !d.set.b) return false; d.phase = 'battle'; d.verses = []; d.rec = null; d.started = Date.now(); }); },
   addVerse(v){ return mutate(d => { if(d.phase !== 'battle' || performerOf(d) !== v.by || d.verses.some(x => x.id === v.id)) return false;
     d.verses.push(v); d.rec = null; if(d.verses.length >= d.set.rounds * 2) d.phase = 'results'; }); },
-  end(){ mutate(d => { if(d.phase === 'lobby') return false; d.phase = 'lobby'; d.verses = []; d.rec = null; fixBattlers(d); }); },
-  rematch(){ autoPlayed.clear(); heard.clear(); mutate(d => { [d.set.a, d.set.b] = [d.set.b, d.set.a]; d.phase = 'battle'; d.verses = []; d.rec = null; d.started = Date.now(); }); },
+  end(){ mutate(d => { if(d.phase === 'lobby') return false; keepBattle(d); d.phase = 'lobby'; d.verses = []; d.rec = null; fixBattlers(d); }); },
+  rematch(){ autoPlayed.clear(); heard.clear(); mutate(d => { keepBattle(d); [d.set.a, d.set.b] = [d.set.b, d.set.a]; d.phase = 'battle'; d.verses = []; d.rec = null; d.started = Date.now(); }); },
   rate(id, n){ mutate(d => { const v = d.verses.find(x => x.id === id); if(!v || v.skipped || v.robot || v.by === me.pid || n < 1 || n > 5) return false; v.ratings = v.ratings || {}; v.ratings[me.pid] = n; }); },
   leaveLobby(){ return mutate(d => { if(d.phase !== 'lobby' || !d.players[me.pid]) return false; delete d.players[me.pid]; d.order = d.order.filter(p => p !== me.pid); if(d.host === me.pid) d.host = d.order[0] || null; fixBattlers(d); }); }
 };
@@ -889,7 +897,6 @@ function soloView(){
 }
 
 /* ---------- save the finished battle as one sound file ---------------- */
-let dlBusy = false;
 function wavBlob(d, rate){
   const b = new ArrayBuffer(44 + d.length * 2), v = new DataView(b), w = (o, s) => { for(let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
   w(0, 'RIFF'); v.setUint32(4, 36 + d.length * 2, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
@@ -897,30 +904,30 @@ function wavBlob(d, rate){
   for(let i = 0; i < d.length; i++){ const s = clamp(d[i], -1, 1); v.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true); }
   return new Blob([b], { type:'audio/wav' });
 }
-async function renderBattle(){
-  const SR = 32000, vs = S.verses.filter(v => !v.skipped && clips.has(v.id)); if(!vs.length) return null;
-  let total = .3; const plan = vs.map(v => { const c = clips.get(v.id), bar = 240 / (BEATS[v.beat] || BEATS.boom).bpm, at = total; total += Math.max(v.bars * bar, c.f.length / RATE) + .8; return { v, c, at }; });
+const loopCache = new Map();                 // one 4-bar beat loop per beat, reused for every verse
+async function beatLoop(id, SR){
+  const key = id + '@' + SR; if(loopCache.has(key)) return loopCache.get(key);
+  const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext, bar = 240 / beatOf(id).bpm;
+  const oc = new OC(1, Math.ceil(4 * bar * SR), SR), g = oc.createGain(); g.gain.value = 1; g.connect(oc.destination);
+  scheduleBeat(oc, g, id, 0, 4, false);
+  const buf = await oc.startRendering(); loopCache.set(key, buf); return buf;
+}
+async function renderBattle(list){
+  const SR = 24000, vs = (list || S.verses).filter(v => !v.skipped && clips.has(v.id)); if(!vs.length) return null;
+  let total = .3; const plan = vs.map(v => { const c = clips.get(v.id), bar = 240 / beatOf(v.beat).bpm, at = total; total += Math.max(v.bars * bar, c.f.length / RATE) + .8; return { v, c, at, bar }; });
+  const loops = {}; for(const { v } of plan) if(!loops[v.beat]) loops[v.beat] = await beatLoop(v.beat, SR);
   const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext, oc = new OC(1, Math.ceil(total * SR), SR);
   const comp = oc.createDynamicsCompressor(); comp.threshold.value = -10; comp.ratio.value = 6;
   const master = oc.createGain(); master.gain.value = .9; master.connect(comp); comp.connect(oc.destination);
-  for(const { v, c, at } of plan){
-    const beatOut = oc.createGain(); beatOut.gain.value = .5; beatOut.connect(master); scheduleBeat(oc, beatOut, v.beat, at, v.bars, false);
+  for(const { v, c, at, bar } of plan){
+    const lp = oc.createBufferSource(), bg = oc.createGain(); bg.gain.value = .5; lp.buffer = loops[v.beat]; lp.loop = true; lp.loopEnd = 4 * bar;
+    lp.connect(bg); bg.connect(master); lp.start(at); lp.stop(at + v.bars * bar);
     const buf = oc.createBuffer(1, c.f.length, RATE); buf.getChannelData(0).set(c.f);
     const src = oc.createBufferSource(), g = oc.createGain(); g.gain.value = 1.3; src.buffer = buf; src.connect(g); g.connect(master); src.start(at);
   }
   const d = (await oc.startRendering()).getChannelData(0); let pk = 0; for(let i = 0; i < d.length; i++){ const a = Math.abs(d[i]); if(a > pk) pk = a; }
   if(pk > .95){ const g = .95 / pk; for(let i = 0; i < d.length; i++) d[i] *= g; }
   return wavBlob(d, SR);
-}
-async function downloadBattle(){
-  if(dlBusy || !S) return; dlBusy = true; render();
-  try{
-    const blob = await renderBattle();
-    if(!blob) toast('There are no recorded verses on this device to save.');
-    else { const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = 'rhyme-rumble-battle.wav'; document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000); toast('Battle saved as rhyme-rumble-battle.wav'); }
-  }catch(e){ console.warn(e); toast('Could not make the sound file on this device.'); }
-  dlBusy = false; render();
 }
 
 /* ---------- recording a verse -------------------------------------- */
@@ -994,7 +1001,7 @@ function playVerse(v){
   scheduleBeat(ac, out, v.beat, t0, v.bars, false);
   const src = ac.createBufferSource(), g = ac.createGain(); g.gain.value = 1.3; src.buffer = buf; src.connect(g); g.connect(MASTER); src.start(t0);
   const p = playing = { id:v.id, t0, dur:buf.duration, env:clip.env, src, out, g };
-  src.onended = () => { if(playing !== p) return; playing = null; try{ out.disconnect(); }catch{} heard.add(v.id); render(); };
+  src.onended = () => { if(playing !== p) return; playing = null; try{ out.disconnect(); }catch{} heard.add(v.id); render(); maybeLiveStart(v); };
   render();
 }
 function maybeAutoPlay(){
@@ -1017,6 +1024,7 @@ function afterState(){
   if(S){
     if(playing && !S.verses.some(v => v.id === playing.id)) stopAudio();
     if(rec && !isTurn(me.pid)) abortRec();
+    if(liveT && !isTurn(me.pid)) cancelLive();
     if(sending && !isTurn(me.pid) && !S.verses.some(v => v.id === sending.entry.id)) sending = null;
     if(S.phase !== 'lobby' && micTest){ micTest.close(); micTest = null; }
     if(bot && performer() !== 'robot') stopBot();
@@ -1033,6 +1041,7 @@ function afterState(){
 function tick(){
   requestAnimationFrame(tick);
   if(!((view === 'room' && S) || (view === 'mini' && rec))) return;
+  if(liveT){ const lc = $('#livecount'); if(lc) lc.textContent = Math.max(1, Math.ceil((liveT.at - Date.now()) / 1000)); }
   const ac = AC; let lvl = 0;
   if(bot && ac){
     const t = ac.currentTime, b = bot, pre = t < b.sch.verseStart, cnt = $('#botcount'), box = $('#botbars');
@@ -1442,6 +1451,78 @@ function challengeView(){
       ${list.length ? '<p class="small">Tap Vote on your favourite. You can change your vote until the week ends.</p>' : ''}</section>${back}`;
 }
 
+/* ---------- battle sound files -------------------------------------
+   A finished battle is turned into one sound file in the background as
+   soon as its verses are on this device, so Send and Download work at
+   once. Files are kept per battle, so a rematch never cancels one.    */
+const files = new Map();                     // battle key -> { state:'busy'|'ready'|'fail', blob }
+const battleKey = vs => vs.filter(v => !v.robot && !v.skipped).map(v => v.id).join('.');
+function srcInfo(src){
+  if(!S) return null;
+  if(src === 'cur') return { vs:S.verses, set:S.set, name:p => (S.players[p] || {}).name || '?' };
+  const h = (S.history || []).find(x => x.id === src); if(!h) return null;
+  return { vs:h.verses, set:h.set, name:p => h.names[p] || (S.players[p] || {}).name || '?' };
+}
+function battleText(info){
+  const t = {}; for(const v of info.vs) t[v.by] = (t[v.by] || 0) + verseScore(v).total;
+  return `${info.name(info.set.a)} vs. ${info.name(info.set.b)} in Rhyme Rumble: ${t[info.set.a] || 0} to ${t[info.set.b] || 0}.`;
+}
+async function prepareFile(src){
+  const info = srcInfo(src); if(!info) return;
+  const key = battleKey(info.vs); if(!key) return;
+  let f = files.get(key); if(f && f.state !== 'fail') return;
+  f = { state:'busy' }; files.set(key, f); render();
+  try{
+    const need = info.vs.filter(v => !v.robot && !v.skipped);
+    await Promise.all(need.map(v => fetchVerse(v.id)));
+    if(!need.every(v => clips.has(v.id))) throw new Error('missing verses');
+    f.blob = await renderBattle(info.vs); f.state = f.blob ? 'ready' : 'fail';
+  }catch(e){ console.warn(e); f.state = 'fail'; }
+  render();
+}
+async function shareBattle(src){
+  const info = srcInfo(src); if(!info) return;
+  const f = files.get(battleKey(info.vs)); if(!f || f.state !== 'ready') return prepareFile(src);
+  const file = new File([f.blob], 'rhyme-rumble-battle.wav', { type:'audio/wav' }), link = shareLink(), text = battleText(info);
+  try{
+    if(navigator.canShare && navigator.canShare({ files:[file] })){
+      await navigator.share({ files:[file], title:'Rhyme Rumble battle', text:link ? text + ' Listen: ' + link : text });
+      return;
+    }
+  }catch(e){ if(e && e.name === 'AbortError') return; console.warn(e); }
+  if(link){ shareOpen = true; render(); const el = $('#sharelink'); if(el) el.scrollIntoView({ block:'center' }); }
+  else saveBlob(f.blob);
+}
+function fileButtons(src, solo){
+  const info = srcInfo(src); if(!info) return '';
+  const key = battleKey(info.vs); if(!key) return '';
+  const f = files.get(key);
+  if(!f || f.state === 'fail') return `<div class="row"><button class="btn sun grow" data-act="prepfile" data-src="${esc(src)}">${f ? 'Try making the sound file again' : 'Make the sound file'}</button></div>`;
+  if(f.state === 'busy') return `<div class="row"><button class="btn sun grow" disabled>Making the sound file…</button></div>`;
+  return `<div class="row"><button class="btn sun grow" data-act="send" data-src="${esc(src)}">${solo ? 'Share' : 'Send the battle'}</button><button class="btn grow" data-act="download" data-src="${esc(src)}">Download</button></div>`;
+}
+function historyCard(){
+  const hs = S && !S.solo ? (S.history || []) : []; if(!hs.length) return '';
+  return `<section class="card"><h2>Earlier battles</h2>${hs.map(h => { const info = srcInfo(h.id), t = {}; for(const v of h.verses) t[v.by] = (t[v.by] || 0) + verseScore(v).total;
+    return `<div class="hist"><div class="hhead"><strong>${esc(info.name(h.set.a))} vs. ${esc(info.name(h.set.b))}</strong><span class="pill tot">${t[h.set.a] || 0} – ${t[h.set.b] || 0}</span></div>
+      <span class="small">${fmtDay(new Date(h.at))} · ${h.verses.length} verses</span>${fileButtons(h.id)}</div>`; }).join('')}
+    <p class="small">Battles stay here until the room is deleted, 30 days after it opened.</p></section>`;
+}
+const snapshot = d => ({ id:rid(6), at:Date.now(), set:{ ...d.set }, verses:d.verses,
+  names:Object.fromEntries(Object.keys(d.players).map(k => [k, d.players[k].name])) });
+function keepBattle(d){ if(d.phase === 'results' && d.verses.length) d.history = [snapshot(d), ...(d.history || [])].slice(0, 5); }
+
+/* ---------- live battles: your beat drops right after their verse ------ */
+let liveT = null;
+function maybeLiveStart(v){
+  if(!S || S.solo || S.set.mode !== 'live' || !isTurn(me.pid) || !myRoom || rec || sending || liveT) return;
+  const l = lastVerse(); if(!l || l.id !== v.id || l.by === me.pid) return;
+  liveT = { at:Date.now() + 5000 };
+  liveT.timer = setTimeout(() => { liveT = null; if(isTurn(me.pid) && !rec && !sending) startVerse(); else render(); }, 5000);
+  render();
+}
+function cancelLive(){ if(liveT){ clearTimeout(liveT.timer); liveT = null; render(); } }
+
 /* ---------- screens ------------------------------------------------ */
 const fmtDay = d => d ? d.toLocaleDateString(undefined, { weekday:'short', day:'numeric', month:'short' }) : '';
 function render(){
@@ -1535,10 +1616,13 @@ function lobbyView(){
     <div class="group"><span class="lab">Verse length</span><div class="opts">${chips('bars', [[4, '4 bars'], [8, '8 bars'], [16, '16 bars']])}</div>
       <span class="small">${s.bars} bars of ${BEATS[s.beat].name} is about ${Math.round(s.bars * 240 / BEATS[s.beat].bpm)} seconds.</span></div>
     <div class="group"><span class="lab">Rounds</span><div class="opts">${chips('rounds', [[1, '1'], [2, '2'], [3, '3']])}</div></div>
+    <div class="group"><span class="lab">How you play</span><div class="opts">${chips('mode', [['live', 'Live, right now'], ['async', 'Any time']])}</div>
+      <span class="small">${s.mode === 'live' ? 'Everyone plays at the same time. Your beat drops by itself 5 seconds after your opponent\'s verse ends.' : 'Answer whenever you have time. The room stays open for 7 days.'}</span></div>
     <div class="group"><span class="lab">Topic</span><div class="topic">${esc(s.topic)}</div>
       ${can ? '<div><button class="btn mini sun" data-act="spin">Spin a new topic</button></div>' : ''}</div>
   </section>
   ${can ? `<button class="btn pink big" data-act="start" ${ready ? '' : 'disabled'}>${ready ? 'Start the battle' : 'Need two rappers'}</button>` : ''}
+  ${historyCard()}
   <div class="row" style="justify-content:center"><button class="btn mini" data-act="home">Back to home</button>${myRoom && !roomClosed ? '<button class="btn mini" data-act="leave">Leave this room</button>' : ''}</div>`;
 }
 function fighter(pid, on, pts, next){
@@ -1587,6 +1671,8 @@ function battleView(){
   else if(mine && (rec || (sending && sending.state === 'up'))) panel = `<div class="spin" style="border-color:#000;border-top-color:var(--pink)"></div><h2>Sending your verse…</h2>`;
   else if(mine && sending) panel = `<h2>Your verse did not send</h2><p class="small">Check the internet connection. Your recording is still here.</p>
         <button class="btn pink big" data-act="resend">Send it again</button><button class="btn mini" data-act="redo">Record a new one</button>`;
+  else if(mine && liveT) panel = `<span class="onair">Live battle</span><h2>Your beat drops in</h2><div class="count" id="livecount">5</div>
+        <button class="btn mini" data-act="livecancel">Not yet</button>`;
   else if(mine) panel = `<h2>Your turn, ${esc(P.name)}!</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. You get a 4-beat count-in, then go.</p>
         <button class="btn pink big" data-act="drop">Drop the beat</button>
         <p class="small">${last && last.by !== me.pid && !heard.has(last.id) && !last.robot ? 'Tip: listen to their verse first, then answer it.' : 'Headphones sound best. The mic switches off when your verse ends.'}</p>`;
@@ -1598,13 +1684,15 @@ function battleView(){
       : `<h2>${esc(P.name)} is up next</h2><p>${s.bars} bars of ${BEATS[s.beat].name}. Listen and read along.</p><button class="btn pink big" data-act="robotgo">Bring it on</button>`;
   else if(recLive()) panel = `<span class="onair">On the mic</span><h2>${esc(P.name)} is rapping now</h2>
         <div class="eq">${[40, 75, 55, 95, 60, 85, 45].map(k => `<i style="--k:${k}"></i>`).join('')}</div><p class="small">The verse shows up here as soon as it is done.</p>`;
-  else panel = `<h2>Waiting for ${esc(P.name)}</h2><p class="small">${esc(P.name)} can answer any time, now or later. The room stays open until ${fmtDay(closesAt)}, and the verse shows up here.</p>
+  else panel = s.mode === 'live' ? `<span class="onair">Live battle</span><h2>${esc(P.name)} is up</h2><p class="small">The verse shows up here as soon as it is done.</p>`
+    : `<h2>Waiting for ${esc(P.name)}</h2><p class="small">${esc(P.name)} can answer any time, now or later. The room stays open until ${fmtDay(closesAt)}, and the verse shows up here.</p>
         ${myRoom ? `<button class="btn sun" data-act="remind">Remind ${esc(P.name)}</button>` : `<button class="btn pink" data-act="join">Join the crowd to rate verses</button>`}`;
   return `<div class="hud"><span>Round ${round} of ${s.rounds}</span><span class="t">${esc(s.topic)}</span></div>
     <div class="face">${fighter(s.a, spot === s.a, tot[s.a] || 0, spot !== cur && cur === s.a)}<span class="vs">VS</span>${fighter(s.b, spot === s.b, tot[s.b] || 0, spot !== cur && cur === s.b)}</div>
     ${last ? versePanel(last) : ''}
     <section class="panel">${panel}</section>
-    <div class="hostbar">${S.solo ? '<button class="btn mini" data-act="end">Quit battle</button>' : `<button class="btn mini" data-act="home">Back to home</button>${canSteer() && !roomClosed ? '<button class="btn mini" data-act="end">End battle</button>' : ''}`}</div>`;
+    <div class="hostbar">${S.solo ? '<button class="btn mini" data-act="end">Quit battle</button>' : `<button class="btn mini" data-act="home">Back to home</button>${canSteer() && !roomClosed ? '<button class="btn mini" data-act="end">End battle</button>' : ''}`}</div>
+    ${historyCard()}`;
 }
 let shareOpen = false;
 function resultsView(){
@@ -1617,13 +1705,13 @@ function resultsView(){
       ${v.skipped ? '' : `<div class="sum"><span class="pill">Flow ${v.judge.flow}</span><span class="pill">Energy ${v.judge.energy}</span><span class="pill">Stamina ${v.judge.stamina}</span>${S.solo || v.robot ? '' : `<span class="pill">Crowd ${sc.crowd}/20</span>`}<span class="pill tot">${sc.total}</span></div>`}
       ${!S.solo && canRate(me.pid, v) ? micsRow(v) : ''}</div>`; }).join('');
   const link = shareLink();
+  if(ready && !files.has(battleKey(S.verses))) setTimeout(() => prepareFile('cur'), 0);     // start the sound file in the background
   return `<div class="winner">${tie ? `<div class="crown">It's a tie!</div><p>${a} points each. Settle it with a rematch.</p>`
       : `<span class="lab" style="color:#CFC4F2">Winner</span>${avHTML(W.av)}<div class="crown">${esc(W.name)}</div>`}</div>
     <div class="face">${fighter(s.a, tie || w === s.a, a)}<span class="vs">VS</span>${fighter(s.b, tie || w === s.b, b)}</div>
     <section class="card"><h2>Every verse</h2>${rows || '<p>No verses were recorded.</p>'}
       <p class="small">${S.solo ? 'Each verse scores up to 30 from Boombot.' : 'Each verse scores up to 30 from Boombot and up to 20 from the crowd. The crowd can keep rating until the room closes.'}</p></section>
-    ${need.length ? `<div class="row"><button class="btn sun grow" data-act="send" ${dlBusy || !ready ? 'disabled' : ''}>${dlBusy ? 'Making the sound file…' : ready ? 'Send the battle' : 'Loading the verses…'}</button>
-        <button class="btn grow" data-act="download" ${dlBusy || !ready ? 'disabled' : ''}>Download</button></div>
+    ${need.length ? `${ready ? fileButtons('cur', S.solo) : '<div class="row"><button class="btn sun grow" disabled>Loading the verses…</button></div>'}
       <p class="small center">${S.solo ? 'One sound file with your verses and the beat. The robot\'s voice cannot be recorded.' : 'One sound file with every verse and the beat. Send opens your phone\'s share menu: Telegram, WhatsApp, email and more.'}</p>` : ''}
     ${shareOpen && link ? `<section class="card share"><h2>Share this battle</h2><p class="small">Anyone with this link can watch and listen to the battle until ${fmtDay(new Date((closesAt ? closesAt.getTime() : Date.now() + 7 * 864e5) + 23 * 864e5))}.</p>
         <input class="field" id="sharelink" readonly value="${esc(link)}">
@@ -1633,6 +1721,7 @@ function resultsView(){
           <a class="btn mini" href="mailto:?subject=${encodeURIComponent('Our Rhyme Rumble battle')}&body=${encodeURIComponent(shareText() + '\n\n' + link)}">Email</a></div></section>` : ''}
     ${canSteer() && !roomClosed ? `<div class="row"><button class="btn pink grow" data-act="rematch">Rematch</button><button class="btn grow" data-act="end">${S.solo ? 'Back to start' : 'Back to the lobby'}</button></div>` : ''}
     ${!S.solo && !canSteer() ? `<button class="btn pink big" data-act="battleme">Battle me: start your own room</button>` : ''}
+    ${historyCard()}
     ${S.solo ? '' : '<div class="center"><button class="btn mini" data-act="home">Back to home</button></div>'}`;
 }
 
@@ -1653,21 +1742,6 @@ async function invite(){
   try{ await navigator.clipboard.writeText(url); toast('Invite link copied. Send it to your crew!'); }catch{ toast(url, 12000); }
 }
 function remind(){ const P = S.players[performer()] || { name:'' }; shareTo(GAME, `${P.name}, it's your turn in our Rhyme Rumble battle! Tap to answer:`, roomLink(S.code)); }
-async function sendBattle(){
-  if(dlBusy || !S) return; dlBusy = true; render();
-  let blob = null; try{ blob = await renderBattle(); }catch(e){ console.warn(e); }
-  dlBusy = false;
-  if(!blob){ render(); return toast('Could not make the sound file on this device.'); }
-  const file = new File([blob], 'rhyme-rumble-battle.wav', { type:'audio/wav' }), link = shareLink();
-  try{
-    if(navigator.canShare && navigator.canShare({ files:[file] })){
-      await navigator.share({ files:[file], title:'Rhyme Rumble battle', text:link ? shareText() + ' ' + link : 'Our Rhyme Rumble battle' });
-      render(); return;
-    }
-  }catch(e){ if(e && e.name === 'AbortError'){ render(); return; } }
-  if(link){ shareOpen = true; render(); const el = $('#sharelink'); if(el) el.scrollIntoView({ block:'center' }); }
-  else { saveBlob(blob); render(); }
-}
 function saveBlob(blob){
   const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = 'rhyme-rumble-battle.wav'; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000); toast('Battle saved as rhyme-rumble-battle.wav');
@@ -1698,8 +1772,10 @@ document.addEventListener('click', e => {
     case 'soloset': { const k = el.dataset.k, v = el.dataset.v; solo[k] = k === 'bars' || k === 'rounds' ? Number(v) : v; if(k === 'beat') previewBeat(v); render(); break; }
     case 'solostart': startSolo(); break;
     case 'robotgo': robotGo(); break;
-    case 'download': (async () => { if(dlBusy) return; dlBusy = true; render(); try{ const b = await renderBattle(); if(b) saveBlob(b); else toast('There are no recorded verses to save.'); }catch(err){ console.warn(err); toast('Could not make the sound file on this device.'); } dlBusy = false; render(); })(); break;
-    case 'send': sendBattle(); break;
+    case 'download': { const info = srcInfo(el.dataset.src || 'cur'), f = info && files.get(battleKey(info.vs)); if(f && f.blob) saveBlob(f.blob); break; }
+    case 'prepfile': prepareFile(el.dataset.src || 'cur'); break;
+    case 'livecancel': cancelLive(); break;
+    case 'send': shareBattle(el.dataset.src || 'cur'); break;
     case 'mini': openMini(el.dataset.game); break;
     case 'hearweek': if(ch.info) previewBeat(weekBeat(ch.info.week)); break;
     case 'chplay': chPlay(el.dataset.week, el.dataset.pid, el.dataset.name); break;
@@ -1732,7 +1808,7 @@ document.addEventListener('click', e => {
   if(!S || !myRoom || roomClosed) return;
   switch(act){
     case 'pick': rules.pick(el.dataset.pid); break;
-    case 'set': { const k = el.dataset.k, v = el.dataset.v; rules.set(k, k === 'beat' ? v : Number(v)); if(k === 'beat') previewBeat(v); break; }
+    case 'set': { const k = el.dataset.k, v = el.dataset.v; rules.set(k, k === 'beat' || k === 'mode' ? v : Number(v)); if(k === 'beat') previewBeat(v); break; }
     case 'spin': { let t; do t = TOPICS[rnd(TOPICS.length)]; while(t === S.set.topic); rules.set('topic', t); break; }
     case 'start': rules.start(); break;
     case 'end': if(S.solo) leave(); else if(canSteer()) rules.end(); break;
